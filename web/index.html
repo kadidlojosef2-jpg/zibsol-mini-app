@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>ZIBSOL</title><script src="https://telegram.org/js/telegram-web-app.js"></script><link rel="stylesheet" href="/static/style.css">
+</head>
+<body><main>
+<header><div><small>TELEGRAM MINI APP</small><h1>ZIBSOL</h1></div><div id="avatar" class="avatar">Z</div></header>
+<section class="card"><small>YOUR BALANCE</small><div id="balance">—</div><span id="gram">— GRAM</span></section>
+<nav><button class="tab active" data-page="earn">🎁 Earn</button><button class="tab" data-page="promote">📢 Promote</button><button class="tab" data-page="withdraw">💸 Withdraw</button></nav>
+<section id="earn" class="page"><h2>Earn ZIBSOL</h2><p class="muted">Join channels and verify your membership.</p><div id="channels">Loading…</div></section>
+<section id="promote" class="page hidden"><h2>Promote your link</h2><p class="muted">100 members = 1,000 ZIBSOL (0.1 GRAM).</p><label>Target members</label><input id="target" type="number" min="100" step="100" value="100"><div id="price">1,000 ZIBSOL</div><label>Telegram link</label><input id="promoLink" placeholder="https://t.me/example"><label>Target channel</label><input id="promoChat" placeholder="@mychannel"><button id="createCampaign" class="primary">Create promotion</button><p id="promoMsg"></p></section>
+<section id="withdraw" class="page hidden"><h2>Withdraw</h2><p class="muted">Minimum withdrawal: 10,000 ZIBSOL = 1 GRAM.</p><label>Wallet address</label><input id="wallet" placeholder="Your wallet address"><button id="withdrawBtn" class="primary">Request withdrawal</button><p id="withdrawMsg"></p></section>
+</main><script src="/static/app.js"></script></body></html>
