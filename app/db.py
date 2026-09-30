@@ -1,107 +1,169 @@
 import os
-from pathlib import Path
-import aiosqlite
+import asyncpg
 
-DB_PATH = os.getenv("DB_PATH", "data/zibsol.db")
 REFERRAL_REWARD = 1000
+DATABASE_URL = os.environ.get("DATABASE_URL")
+_pool = None
 
 async def init_db():
-    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.executescript("""
-        PRAGMA journal_mode=WAL;
-        CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, balance INTEGER NOT NULL DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS channels (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT UNIQUE NOT NULL, title TEXT NOT NULL, reward INTEGER NOT NULL DEFAULT 100, join_link TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1);
-        CREATE TABLE IF NOT EXISTS claims (user_id INTEGER NOT NULL, channel_id INTEGER NOT NULL, reward INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (user_id, channel_id));
-        CREATE TABLE IF NOT EXISTS campaigns (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, target_members INTEGER NOT NULL, price_zibsol INTEGER NOT NULL, link TEXT NOT NULL, chat_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-        CREATE TABLE IF NOT EXISTS withdrawals (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, amount INTEGER NOT NULL, wallet TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-        CREATE TABLE IF NOT EXISTS ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, amount INTEGER NOT NULL, reason TEXT NOT NULL, reference TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-        CREATE TABLE IF NOT EXISTS referrals (referred_user_id INTEGER PRIMARY KEY, referrer_user_id INTEGER NOT NULL, reward INTEGER NOT NULL DEFAULT 1000, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-        """)
-        await db.commit()
+    global _pool
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not configured")
+    _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    async with _pool.acquire() as db:
+        await db.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id BIGINT PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            balance BIGINT NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS channels (
+            id BIGSERIAL PRIMARY KEY,
+            chat_id TEXT UNIQUE NOT NULL,
+            title TEXT NOT NULL,
+            reward BIGINT NOT NULL DEFAULT 100,
+            join_link TEXT NOT NULL,
+            active BOOLEAN NOT NULL DEFAULT TRUE
+        );
+        CREATE TABLE IF NOT EXISTS claims (
+            user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            channel_id BIGINT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+            reward BIGINT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (user_id, channel_id)
+        );
+        CREATE TABLE IF NOT EXISTS campaigns (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL REFERENCES users(id),
+            target_members INTEGER NOT NULL,
+            price_zibsol BIGINT NOT NULL,
+            link TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS withdrawals (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL REFERENCES users(id),
+            amount BIGINT NOT NULL,
+            wallet TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS ledger (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL REFERENCES users(id),
+            amount BIGINT NOT NULL,
+            reason TEXT NOT NULL,
+            reference TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS referrals (
+            referred_user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            referrer_user_id BIGINT NOT NULL REFERENCES users(id),
+            reward BIGINT NOT NULL DEFAULT 1000,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_user_id);
+        ''')
+
+async def close_db():
+    global _pool
+    if _pool:
+        await _pool.close()
+        _pool = None
+
+def pool():
+    if _pool is None:
+        raise RuntimeError("Database pool is not initialized")
+    return _pool
 
 async def user_exists(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        return await (await db.execute("SELECT 1 FROM users WHERE id=?", (user_id,))).fetchone() is not None
+    async with pool().acquire() as db:
+        return await db.fetchval("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1)", user_id)
 
 async def upsert_user(user):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO users(id,username,first_name) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name", (user["id"], user.get("username"), user.get("first_name")))
-        await db.commit()
+    async with pool().acquire() as db:
+        await db.execute("""INSERT INTO users(id,username,first_name) VALUES($1,$2,$3)
+        ON CONFLICT(id) DO UPDATE SET username=EXCLUDED.username, first_name=EXCLUDED.first_name""",
+        user["id"], user.get("username"), user.get("first_name"))
 
 async def get_balance(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        row = await (await db.execute("SELECT balance FROM users WHERE id=?", (user_id,))).fetchone()
-        return int(row[0]) if row else 0
+    async with pool().acquire() as db:
+        row = await db.fetchrow("SELECT balance FROM users WHERE id=$1", user_id)
+        return int(row["balance"]) if row else 0
 
 async def list_channels(active_only=True):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with pool().acquire() as db:
         sql = "SELECT id,chat_id,title,reward,join_link,active FROM channels"
-        if active_only: sql += " WHERE active=1"
-        sql += " ORDER BY id"
-        return await (await db.execute(sql)).fetchall()
+        if active_only: sql += " WHERE active=TRUE"
+        return await db.fetch(sql + " ORDER BY id")
 
 async def add_channel(chat_id, title, reward, join_link):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("INSERT INTO channels(chat_id,title,reward,join_link,active) VALUES(?,?,?,?,1) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,reward=excluded.reward,join_link=excluded.join_link,active=1", (chat_id,title,reward,join_link))
-        await db.commit()
-        return cur.lastrowid
+    async with pool().acquire() as db:
+        row = await db.fetchrow("""INSERT INTO channels(chat_id,title,reward,join_link,active)
+        VALUES($1,$2,$3,$4,TRUE)
+        ON CONFLICT(chat_id) DO UPDATE SET title=EXCLUDED.title,reward=EXCLUDED.reward,join_link=EXCLUDED.join_link,active=TRUE
+        RETURNING id""", chat_id,title,reward,join_link)
+        return int(row["id"])
 
 async def deactivate_channel(channel_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("UPDATE channels SET active=0 WHERE id=?", (channel_id,))
-        await db.commit()
-        return cur.rowcount > 0
+    async with pool().acquire() as db:
+        result = await db.execute("UPDATE channels SET active=FALSE WHERE id=$1", channel_id)
+        return result.endswith("1")
+
+async def get_channel(channel_id):
+    async with pool().acquire() as db:
+        return await db.fetchrow("SELECT chat_id FROM channels WHERE id=$1 AND active=TRUE", channel_id)
 
 async def claim_channel(user_id, channel_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("BEGIN IMMEDIATE")
-        if await (await db.execute("SELECT 1 FROM claims WHERE user_id=? AND channel_id=?", (user_id, channel_id))).fetchone(): await db.rollback(); return None
-        row = await (await db.execute("SELECT reward FROM channels WHERE id=? AND active=1", (channel_id,))).fetchone()
-        if not row: await db.rollback(); return None
-        reward = int(row[0])
-        await db.execute("INSERT INTO claims(user_id,channel_id,reward) VALUES(?,?,?)", (user_id,channel_id,reward))
-        await db.execute("UPDATE users SET balance=balance+? WHERE id=?", (reward,user_id))
-        await db.execute("INSERT INTO ledger(user_id,amount,reason,reference) VALUES(?,?,?,?)", (user_id,reward,"channel_join",str(channel_id)))
-        await db.commit(); return reward
+    async with pool().acquire() as db:
+        async with db.transaction():
+            exists = await db.fetchval("SELECT EXISTS(SELECT 1 FROM claims WHERE user_id=$1 AND channel_id=$2)", user_id, channel_id)
+            if exists: return None
+            row = await db.fetchrow("SELECT reward FROM channels WHERE id=$1 AND active=TRUE", channel_id)
+            if not row: return None
+            reward = int(row["reward"])
+            await db.execute("INSERT INTO claims(user_id,channel_id,reward) VALUES($1,$2,$3)", user_id,channel_id,reward)
+            await db.execute("UPDATE users SET balance=balance+$1 WHERE id=$2", reward,user_id)
+            await db.execute("INSERT INTO ledger(user_id,amount,reason,reference) VALUES($1,$2,$3,$4)", user_id,reward,"channel_join",str(channel_id))
+            return reward
 
 async def create_campaign(user_id, target, price, link, chat_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("BEGIN IMMEDIATE")
-        row = await (await db.execute("SELECT balance FROM users WHERE id=?", (user_id,))).fetchone()
-        if not row or row[0] < price: await db.rollback(); return None
-        await db.execute("UPDATE users SET balance=balance-? WHERE id=?", (price,user_id))
-        cur = await db.execute("INSERT INTO campaigns(user_id,target_members,price_zibsol,link,chat_id) VALUES(?,?,?,?,?)", (user_id,target,price,link,chat_id))
-        campaign_id = cur.lastrowid
-        await db.execute("INSERT INTO ledger(user_id,amount,reason,reference) VALUES(?,?,?,?)", (user_id,-price,"promotion_purchase",str(campaign_id)))
-        await db.commit(); return campaign_id
+    async with pool().acquire() as db:
+        async with db.transaction():
+            balance = await db.fetchval("SELECT balance FROM users WHERE id=$1 FOR UPDATE", user_id)
+            if balance is None or balance < price: return None
+            await db.execute("UPDATE users SET balance=balance-$1 WHERE id=$2", price,user_id)
+            row = await db.fetchrow("INSERT INTO campaigns(user_id,target_members,price_zibsol,link,chat_id) VALUES($1,$2,$3,$4,$5) RETURNING id", user_id,target,price,link,chat_id)
+            cid = int(row["id"])
+            await db.execute("INSERT INTO ledger(user_id,amount,reason,reference) VALUES($1,$2,$3,$4)", user_id,-price,"promotion_purchase",str(cid))
+            return cid
 
 async def create_withdrawal(user_id, wallet):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("BEGIN IMMEDIATE")
-        row = await (await db.execute("SELECT balance FROM users WHERE id=?", (user_id,))).fetchone()
-        balance = int(row[0]) if row else 0
-        if balance < 10000: await db.rollback(); return None
-        await db.execute("UPDATE users SET balance=0 WHERE id=?", (user_id,))
-        cur = await db.execute("INSERT INTO withdrawals(user_id,amount,wallet) VALUES(?,?,?)", (user_id,balance,wallet))
-        withdrawal_id = cur.lastrowid
-        await db.execute("INSERT INTO ledger(user_id,amount,reason,reference) VALUES(?,?,?,?)", (user_id,-balance,"withdrawal_hold",str(withdrawal_id)))
-        await db.commit(); return withdrawal_id
+    async with pool().acquire() as db:
+        async with db.transaction():
+            balance = await db.fetchval("SELECT balance FROM users WHERE id=$1 FOR UPDATE", user_id)
+            balance = int(balance or 0)
+            if balance < 10000: return None
+            await db.execute("UPDATE users SET balance=0 WHERE id=$1", user_id)
+            row = await db.fetchrow("INSERT INTO withdrawals(user_id,amount,wallet) VALUES($1,$2,$3) RETURNING id", user_id,balance,wallet)
+            wid = int(row["id"])
+            await db.execute("INSERT INTO ledger(user_id,amount,reason,reference) VALUES($1,$2,$3,$4)", user_id,-balance,"withdrawal_hold",str(wid))
+            return wid
 
 async def apply_referral(referrer_user_id, referred_user_id):
     if referrer_user_id == referred_user_id: return False
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("BEGIN IMMEDIATE")
-        referrer = await (await db.execute("SELECT id FROM users WHERE id=?", (referrer_user_id,))).fetchone()
-        if not referrer: await db.rollback(); return False
-        exists = await (await db.execute("SELECT 1 FROM referrals WHERE referred_user_id=?", (referred_user_id,))).fetchone()
-        if exists: await db.rollback(); return False
-        await db.execute("INSERT INTO referrals(referred_user_id,referrer_user_id,reward) VALUES(?,?,?)", (referred_user_id,referrer_user_id,REFERRAL_REWARD))
-        await db.execute("UPDATE users SET balance=balance+? WHERE id=?", (REFERRAL_REWARD,referrer_user_id))
-        await db.execute("INSERT INTO ledger(user_id,amount,reason,reference) VALUES(?,?,?,?)", (referrer_user_id,REFERRAL_REWARD,"referral",str(referred_user_id)))
-        await db.commit(); return True
+    async with pool().acquire() as db:
+        async with db.transaction():
+            if not await db.fetchval("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1)", referrer_user_id): return False
+            if await db.fetchval("SELECT EXISTS(SELECT 1 FROM referrals WHERE referred_user_id=$1)", referred_user_id): return False
+            await db.execute("INSERT INTO referrals(referred_user_id,referrer_user_id,reward) VALUES($1,$2,$3)", referred_user_id,referrer_user_id,REFERRAL_REWARD)
+            await db.execute("UPDATE users SET balance=balance+$1 WHERE id=$2", REFERRAL_REWARD,referrer_user_id)
+            await db.execute("INSERT INTO ledger(user_id,amount,reason,reference) VALUES($1,$2,$3,$4)", referrer_user_id,REFERRAL_REWARD,"referral",str(referred_user_id))
+            return True
 
 async def referral_count(user_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        row = await (await db.execute("SELECT COUNT(*) FROM referrals WHERE referrer_user_id=?", (user_id,))).fetchone()
-        return int(row[0])
+    async with pool().acquire() as db:
+        return int(await db.fetchval("SELECT COUNT(*) FROM referrals WHERE referrer_user_id=$1", user_id))
