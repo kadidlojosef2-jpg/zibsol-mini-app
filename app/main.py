@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 from decimal import Decimal
@@ -16,10 +17,24 @@ app = FastAPI(title="ZIBSOL Mini App API")
 app.mount("/static", StaticFiles(directory=WEB), name="static")
 ZIBSOL_PER_GRAM = 10000
 MIN_WITHDRAWAL = 10000
+_bot_task = None
 
 @app.on_event("startup")
 async def startup():
+    global _bot_task
     await db.init_db()
+    from .bot import run_bot
+    _bot_task = asyncio.create_task(run_bot())
+
+@app.on_event("shutdown")
+async def shutdown():
+    global _bot_task
+    if _bot_task:
+        _bot_task.cancel()
+        try:
+            await _bot_task
+        except asyncio.CancelledError:
+            pass
 
 @app.get("/")
 async def home():
@@ -82,6 +97,20 @@ async def me(authorization: str | None = Header(default=None)):
     balance = await db.get_balance(user["id"])
     return {"user": user, "balance": balance, "gram": str(Decimal(balance) / ZIBSOL_PER_GRAM), "is_admin": user["id"] in admin_ids()}
 
+@app.get("/api/referral")
+async def referral(authorization: str | None = Header(default=None)):
+    user = get_telegram_user(authorization)
+    await db.upsert_user(user)
+    bot = await telegram_api("getMe", {})
+    count = await db.referral_count(user["id"])
+    reward = db.REFERRAL_REWARD
+    return {
+        "count": count,
+        "reward_per_ref": reward,
+        "total_earned": count * reward,
+        "link": f"https://t.me/{bot['username']}?start=ref_{user['id']}"
+    }
+
 @app.get("/api/channels")
 async def channels(authorization: str | None = Header(default=None)):
     user = get_telegram_user(authorization)
@@ -99,12 +128,7 @@ async def claim(body: ClaimBody, authorization: str | None = Header(default=None
         row = await (await conn.execute("SELECT chat_id FROM channels WHERE id=? AND active=1", (body.channel_id,))).fetchone()
     if not row:
         raise HTTPException(404, "Channel not found")
-    try:
-        is_member = await verify_user_membership(row[0], user["id"])
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(400, f"Could not verify membership: {exc}")
+    is_member = await verify_user_membership(row[0], user["id"])
     if not is_member:
         raise HTTPException(400, "You have not joined this channel yet")
     reward = await db.claim_channel(user["id"], body.channel_id)
