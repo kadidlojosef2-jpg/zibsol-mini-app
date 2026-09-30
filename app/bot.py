@@ -11,16 +11,19 @@ async def start(message: Message, command: CommandObject):
     user = message.from_user
     if not user:
         return
-    data = {"id": user.id, "username": user.username, "first_name": user.first_name}
-    await db.upsert_user(data)
 
+    data = {"id": user.id, "username": user.username, "first_name": user.first_name}
+    was_new_user = not await db.user_exists(user.id)
     rewarded = False
-    if command.args and command.args.startswith("ref_"):
+
+    if command.args and command.args.startswith("ref_") and was_new_user:
         try:
             referrer_id = int(command.args[4:])
             rewarded = await db.apply_referral(referrer_id, user.id)
         except (ValueError, TypeError):
             pass
+
+    await db.upsert_user(data)
 
     app_url = os.getenv("APP_URL", "").rstrip("/")
     if not app_url:
@@ -29,7 +32,9 @@ async def start(message: Message, command: CommandObject):
 
     text = "🎉 Welcome to ZIBSOL!\n\nEarn ZIBSOL by joining channels and inviting friends."
     if rewarded:
-        text += "\n\n✅ Your referral was registered. The inviter received 1,000 ZIBSOL."
+        text += "\n\n✅ Referral registered. The inviter received 1,000 ZIBSOL."
+    elif command.args and command.args.startswith("ref_") and not was_new_user:
+        text += "\n\nℹ️ This Telegram account was already registered, so no new referral reward was created."
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🚀 Open ZIBSOL APP", web_app=WebAppInfo(url=app_url))
