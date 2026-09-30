@@ -71,9 +71,28 @@ async def get_balance(user_id):
         row = await (await db.execute("SELECT balance FROM users WHERE id=?", (user_id,))).fetchone()
         return int(row[0]) if row else 0
 
-async def list_channels():
+async def list_channels(active_only=True):
     async with aiosqlite.connect(DB_PATH) as db:
-        return await (await db.execute("SELECT id,title,reward,join_link FROM channels WHERE active=1 ORDER BY id")).fetchall()
+        sql = "SELECT id,chat_id,title,reward,join_link,active FROM channels"
+        if active_only:
+            sql += " WHERE active=1"
+        sql += " ORDER BY id"
+        return await (await db.execute(sql)).fetchall()
+
+async def add_channel(chat_id, title, reward, join_link):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""INSERT INTO channels(chat_id,title,reward,join_link,active)
+        VALUES(?,?,?,?,1)
+        ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,reward=excluded.reward,
+        join_link=excluded.join_link,active=1""", (chat_id,title,reward,join_link))
+        await db.commit()
+        return cur.lastrowid
+
+async def deactivate_channel(channel_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("UPDATE channels SET active=0 WHERE id=?", (channel_id,))
+        await db.commit()
+        return cur.rowcount > 0
 
 async def claim_channel(user_id, channel_id):
     async with aiosqlite.connect(DB_PATH) as db:
