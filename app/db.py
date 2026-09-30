@@ -3,6 +3,7 @@ from pathlib import Path
 import aiosqlite
 
 DB_PATH = os.getenv("DB_PATH", "data/zibsol.db")
+REFERRAL_REWARD = 1000
 
 async def init_db():
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -54,6 +55,12 @@ async def init_db():
             amount INTEGER NOT NULL,
             reason TEXT NOT NULL,
             reference TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS referrals (
+            referred_user_id INTEGER PRIMARY KEY,
+            referrer_user_id INTEGER NOT NULL,
+            reward INTEGER NOT NULL DEFAULT 1000,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         """)
@@ -135,3 +142,25 @@ async def create_withdrawal(user_id, wallet):
         await db.execute("INSERT INTO ledger(user_id,amount,reason,reference) VALUES(?,?,?,?)", (user_id,-balance,"withdrawal_hold",str(withdrawal_id)))
         await db.commit()
         return withdrawal_id
+
+async def apply_referral(referrer_user_id, referred_user_id):
+    if referrer_user_id == referred_user_id:
+        return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        referrer = await (await db.execute("SELECT id FROM users WHERE id=?", (referrer_user_id,))).fetchone()
+        if not referrer:
+            await db.rollback(); return False
+        exists = await (await db.execute("SELECT 1 FROM referrals WHERE referred_user_id=?", (referred_user_id,))).fetchone()
+        if exists:
+            await db.rollback(); return False
+        await db.execute("INSERT INTO referrals(referred_user_id,referrer_user_id,reward) VALUES(?,?,?)", (referred_user_id,referrer_user_id,REFERRAL_REWARD))
+        await db.execute("UPDATE users SET balance=balance+? WHERE id=?", (REFERRAL_REWARD,referrer_user_id))
+        await db.execute("INSERT INTO ledger(user_id,amount,reason,reference) VALUES(?,?,?,?)", (referrer_user_id,REFERRAL_REWARD,"referral",str(referred_user_id)))
+        await db.commit()
+        return True
+
+async def referral_count(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        row = await (await db.execute("SELECT COUNT(*) FROM referrals WHERE referrer_user_id=?", (user_id,))).fetchone()
+        return int(row[0])
