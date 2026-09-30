@@ -35,6 +35,7 @@ async def shutdown():
             await _bot_task
         except asyncio.CancelledError:
             pass
+    await db.close_db()
 
 @app.get("/")
 async def home():
@@ -42,7 +43,7 @@ async def home():
 
 @app.get("/health")
 async def health():
-    return {"ok": True}
+    return {"ok": True, "database": "postgresql"}
 
 def get_telegram_user(authorization):
     if not authorization or not authorization.startswith("tma "):
@@ -104,18 +105,13 @@ async def referral(authorization: str | None = Header(default=None)):
     bot = await telegram_api("getMe", {})
     count = await db.referral_count(user["id"])
     reward = db.REFERRAL_REWARD
-    return {
-        "count": count,
-        "reward_per_ref": reward,
-        "total_earned": count * reward,
-        "link": f"https://t.me/{bot['username']}?start=ref_{user['id']}"
-    }
+    return {"count": count, "reward_per_ref": reward, "total_earned": count * reward, "link": f"https://t.me/{bot['username']}?start=ref_{user['id']}"}
 
 @app.get("/api/channels")
 async def channels(authorization: str | None = Header(default=None)):
     user = get_telegram_user(authorization)
     await db.upsert_user(user)
-    return [{"id":r[0],"chat_id":r[1],"title":r[2],"reward":r[3],"join_link":r[4]} for r in await db.list_channels(True)]
+    return [{"id":r["id"],"chat_id":r["chat_id"],"title":r["title"],"reward":r["reward"],"join_link":r["join_link"]} for r in await db.list_channels(True)]
 
 class ClaimBody(BaseModel):
     channel_id: int
@@ -124,12 +120,10 @@ class ClaimBody(BaseModel):
 async def claim(body: ClaimBody, authorization: str | None = Header(default=None)):
     user = get_telegram_user(authorization)
     await db.upsert_user(user)
-    async with __import__('aiosqlite').connect(db.DB_PATH) as conn:
-        row = await (await conn.execute("SELECT chat_id FROM channels WHERE id=? AND active=1", (body.channel_id,))).fetchone()
+    row = await db.get_channel(body.channel_id)
     if not row:
         raise HTTPException(404, "Channel not found")
-    is_member = await verify_user_membership(row[0], user["id"])
-    if not is_member:
+    if not await verify_user_membership(row["chat_id"], user["id"]):
         raise HTTPException(400, "You have not joined this channel yet")
     reward = await db.claim_channel(user["id"], body.channel_id)
     if reward is None:
@@ -181,7 +175,7 @@ async def admin_status(authorization: str | None = Header(default=None)):
 @app.get("/api/admin/channels")
 async def admin_channels(authorization: str | None = Header(default=None)):
     require_admin(authorization)
-    return [{"id":r[0],"chat_id":r[1],"title":r[2],"reward":r[3],"join_link":r[4],"active":bool(r[5])} for r in await db.list_channels(False)]
+    return [{"id":r["id"],"chat_id":r["chat_id"],"title":r["title"],"reward":r["reward"],"join_link":r["join_link"],"active":bool(r["active"])} for r in await db.list_channels(False)]
 
 @app.post("/api/admin/channels")
 async def add_channel(body: AddChannelBody, authorization: str | None = Header(default=None)):
