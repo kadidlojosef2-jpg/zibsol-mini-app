@@ -10,6 +10,6 @@ services:
         sync: false
       - key: APP_URL
         sync: false
-      - key: DB_PATH
-        value: /app/data/zibsol.db
+      - key: DATABASE_URL
+        sync: false
     healthCheckPath: /health
