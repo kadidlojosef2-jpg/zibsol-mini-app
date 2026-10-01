@@ -3,7 +3,7 @@ import uuid
 import asyncpg
 
 REFERRAL_REWARD = 1000
-PROMO_REWARD_PER_MEMBER = int(os.getenv("PROMO_REWARD_PER_MEMBER", "10"))
+PROMO_REWARD_PER_MEMBER = int(os.getenv("PROMO_REWARD_PER_MEMBER", "100"))
 DATABASE_URL = os.environ.get("DATABASE_URL")
 _pool = None
 
@@ -49,14 +49,16 @@ async def init_db():
             price_stars BIGINT NOT NULL DEFAULT 0,
             stars_charge_id TEXT,
             completed_members INTEGER NOT NULL DEFAULT 0,
-            reward_per_member BIGINT NOT NULL DEFAULT 10,
+            reward_per_member BIGINT NOT NULL DEFAULT 100,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT 'zibsol';
         ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS price_stars BIGINT NOT NULL DEFAULT 0;
         ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS stars_charge_id TEXT;
         ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS completed_members INTEGER NOT NULL DEFAULT 0;
-        ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS reward_per_member BIGINT NOT NULL DEFAULT 10;
+        ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS reward_per_member BIGINT NOT NULL DEFAULT 100;
+        ALTER TABLE campaigns ALTER COLUMN reward_per_member SET DEFAULT 100;
+        UPDATE campaigns SET reward_per_member=100 WHERE status='pending';
         CREATE TABLE IF NOT EXISTS campaign_participants (
             campaign_id BIGINT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
             user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -213,10 +215,10 @@ async def complete_star_order(payload, telegram_user_id, charge_id):
 
 async def list_campaigns_for_user(user_id):
     async with pool().acquire() as db:
-        return await db.fetch("""SELECT c.id,c.title,c.target_members,c.completed_members,c.reward_per_member,c.link,c.chat_id,c.status,c.payment_method
-        FROM (SELECT id, target_members, completed_members, reward_per_member, link, chat_id, status, payment_method, NULL::TEXT AS title, user_id FROM campaigns) c
-        WHERE c.status='pending' AND c.completed_members < c.target_members AND c.user_id <> $1
-        ORDER BY c.id DESC LIMIT 50""", user_id)
+        return await db.fetch("""SELECT id,target_members,completed_members,reward_per_member,link,chat_id,status,payment_method
+        FROM campaigns
+        WHERE status='pending' AND completed_members < target_members AND user_id <> $1
+        ORDER BY id DESC LIMIT 50""", user_id)
 
 async def list_campaigns():
     async with pool().acquire() as db:
