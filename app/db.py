@@ -16,8 +16,10 @@ async def init_db():
             id BIGINT PRIMARY KEY,
             username TEXT,
             first_name TEXT,
-            balance BIGINT NOT NULL DEFAULT 0
+            balance BIGINT NOT NULL DEFAULT 0,
+            wallet_address TEXT
         );
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS wallet_address TEXT;
         CREATE TABLE IF NOT EXISTS channels (
             id BIGSERIAL PRIMARY KEY,
             chat_id TEXT UNIQUE NOT NULL,
@@ -37,11 +39,31 @@ async def init_db():
             id BIGSERIAL PRIMARY KEY,
             user_id BIGINT NOT NULL REFERENCES users(id),
             target_members INTEGER NOT NULL,
-            price_zibsol BIGINT NOT NULL,
+            price_zibsol BIGINT NOT NULL DEFAULT 0,
             link TEXT NOT NULL,
             chat_id TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending',
+            payment_method TEXT NOT NULL DEFAULT 'zibsol',
+            price_stars BIGINT NOT NULL DEFAULT 0,
+            stars_charge_id TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT 'zibsol';
+        ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS price_stars BIGINT NOT NULL DEFAULT 0;
+        ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS stars_charge_id TEXT;
+        CREATE TABLE IF NOT EXISTS star_orders (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL REFERENCES users(id),
+            target_members INTEGER NOT NULL,
+            price_stars BIGINT NOT NULL,
+            link TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            payload TEXT UNIQUE NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            campaign_id BIGINT REFERENCES campaigns(id),
+            telegram_charge_id TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            paid_at TIMESTAMPTZ
         );
         CREATE TABLE IF NOT EXISTS withdrawals (
             id BIGSERIAL PRIMARY KEY,
@@ -66,6 +88,7 @@ async def init_db():
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_user_id);
+        CREATE INDEX IF NOT EXISTS idx_star_orders_payload ON star_orders(payload);
         ''')
 
 async def close_db():
@@ -93,6 +116,14 @@ async def get_balance(user_id):
     async with pool().acquire() as db:
         row = await db.fetchrow("SELECT balance FROM users WHERE id=$1", user_id)
         return int(row["balance"]) if row else 0
+
+async def get_wallet(user_id):
+    async with pool().acquire() as db:
+        return await db.fetchval("SELECT wallet_address FROM users WHERE id=$1", user_id)
+
+async def set_wallet(user_id, wallet_address):
+    async with pool().acquire() as db:
+        await db.execute("UPDATE users SET wallet_address=$1 WHERE id=$2", wallet_address, user_id)
 
 async def list_channels(active_only=True):
     async with pool().acquire() as db:
@@ -136,9 +167,34 @@ async def create_campaign(user_id, target, price, link, chat_id):
             balance = await db.fetchval("SELECT balance FROM users WHERE id=$1 FOR UPDATE", user_id)
             if balance is None or balance < price: return None
             await db.execute("UPDATE users SET balance=balance-$1 WHERE id=$2", price,user_id)
-            row = await db.fetchrow("INSERT INTO campaigns(user_id,target_members,price_zibsol,link,chat_id) VALUES($1,$2,$3,$4,$5) RETURNING id", user_id,target,price,link,chat_id)
+            row = await db.fetchrow("INSERT INTO campaigns(user_id,target_members,price_zibsol,link,chat_id,payment_method,status) VALUES($1,$2,$3,$4,$5,'zibsol','pending') RETURNING id", user_id,target,price,link,chat_id)
             cid = int(row["id"])
             await db.execute("INSERT INTO ledger(user_id,amount,reason,reference) VALUES($1,$2,$3,$4)", user_id,-price,"promotion_purchase",str(cid))
+            return cid
+
+async def create_star_order(user_id, target, price_stars, link, chat_id):
+    async with pool().acquire() as db:
+        row = await db.fetchrow("""INSERT INTO star_orders(user_id,target_members,price_stars,link,chat_id,payload)
+        VALUES($1,$2,$3,$4,$5,$6) RETURNING id""", user_id,target,price_stars,link,chat_id,"pending")
+        order_id = int(row["id"])
+        payload = f"zibsolpromo:{order_id}"
+        await db.execute("UPDATE star_orders SET payload=$1 WHERE id=$2", payload, order_id)
+        return order_id, payload
+
+async def get_star_order_by_payload(payload):
+    async with pool().acquire() as db:
+        return await db.fetchrow("SELECT * FROM star_orders WHERE payload=$1", payload)
+
+async def complete_star_order(payload, telegram_user_id, charge_id):
+    async with pool().acquire() as db:
+        async with db.transaction():
+            order = await db.fetchrow("SELECT * FROM star_orders WHERE payload=$1 FOR UPDATE", payload)
+            if not order or int(order["user_id"]) != int(telegram_user_id): return None
+            if order["status"] == "paid": return int(order["campaign_id"]) if order["campaign_id"] else None
+            campaign = await db.fetchrow("""INSERT INTO campaigns(user_id,target_members,price_zibsol,link,chat_id,status,payment_method,price_stars,stars_charge_id)
+            VALUES($1,$2,0,$3,$4,'pending','stars',$5,$6) RETURNING id""", order["user_id"],order["target_members"],order["link"],order["chat_id"],order["price_stars"],charge_id)
+            cid = int(campaign["id"])
+            await db.execute("UPDATE star_orders SET status='paid',campaign_id=$1,telegram_charge_id=$2,paid_at=NOW() WHERE id=$3", cid,charge_id,order["id"])
             return cid
 
 async def create_withdrawal(user_id, wallet):
@@ -147,7 +203,7 @@ async def create_withdrawal(user_id, wallet):
             balance = await db.fetchval("SELECT balance FROM users WHERE id=$1 FOR UPDATE", user_id)
             balance = int(balance or 0)
             if balance < 10000: return None
-            await db.execute("UPDATE users SET balance=0 WHERE id=$1", user_id)
+            await db.execute("UPDATE users SET balance=0,wallet_address=$1 WHERE id=$2", wallet,user_id)
             row = await db.fetchrow("INSERT INTO withdrawals(user_id,amount,wallet) VALUES($1,$2,$3) RETURNING id", user_id,balance,wallet)
             wid = int(row["id"])
             await db.execute("INSERT INTO ledger(user_id,amount,reason,reference) VALUES($1,$2,$3,$4)", user_id,-balance,"withdrawal_hold",str(wid))
