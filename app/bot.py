@@ -1,7 +1,7 @@
 import os
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import CommandStart, CommandObject
-from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, PreCheckoutQuery
 from . import db
 
 router = Router()
@@ -47,6 +47,36 @@ async def referrals(message: Message):
         return
     count = await db.referral_count(message.from_user.id)
     await message.answer(f"👥 Referrals: {count}\n💰 Reward: {count * db.REFERRAL_REWARD:,} ZIBSOL")
+
+@router.pre_checkout_query()
+async def pre_checkout(query: PreCheckoutQuery):
+    order = await db.get_star_order_by_payload(query.invoice_payload)
+    if not order or order["status"] != "pending":
+        await query.answer(ok=False, error_message="This promotion order is no longer available.")
+        return
+    if int(order["user_id"]) != int(query.from_user.id) or query.currency != "XTR":
+        await query.answer(ok=False, error_message="Payment does not match this order.")
+        return
+    if int(order["price_stars"]) != int(query.total_amount):
+        await query.answer(ok=False, error_message="The invoice amount does not match the order.")
+        return
+    await query.answer(ok=True)
+
+@router.message(F.successful_payment)
+async def successful_payment(message: Message):
+    if not message.from_user or not message.successful_payment:
+        return
+    payment = message.successful_payment
+    campaign_id = await db.complete_star_order(
+        payment.invoice_payload,
+        message.from_user.id,
+        payment.telegram_payment_charge_id,
+    )
+    if campaign_id:
+        await message.answer(
+            f"✅ Payment received: {payment.total_amount} Telegram Stars.\n"
+            f"📣 Promotion #{campaign_id} is now queued for processing."
+        )
 
 async def run_bot():
     token = os.getenv("BOT_TOKEN")
