@@ -1,4 +1,5 @@
 import os
+import uuid
 import asyncpg
 
 REFERRAL_REWARD = 1000
@@ -174,12 +175,10 @@ async def create_campaign(user_id, target, price, link, chat_id):
 
 async def create_star_order(user_id, target, price_stars, link, chat_id):
     async with pool().acquire() as db:
+        payload = f"zibsolpromo:{uuid.uuid4().hex}"
         row = await db.fetchrow("""INSERT INTO star_orders(user_id,target_members,price_stars,link,chat_id,payload)
-        VALUES($1,$2,$3,$4,$5,$6) RETURNING id""", user_id,target,price_stars,link,chat_id,"pending")
-        order_id = int(row["id"])
-        payload = f"zibsolpromo:{order_id}"
-        await db.execute("UPDATE star_orders SET payload=$1 WHERE id=$2", payload, order_id)
-        return order_id, payload
+        VALUES($1,$2,$3,$4,$5,$6) RETURNING id""", user_id,target,price_stars,link,chat_id,payload)
+        return int(row["id"]), payload
 
 async def get_star_order_by_payload(payload):
     async with pool().acquire() as db:
