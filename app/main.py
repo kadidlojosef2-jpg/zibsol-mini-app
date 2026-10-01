@@ -144,6 +144,22 @@ class CampaignBody(BaseModel):
     link: str
     chat_id: str
 
+@app.get("/api/campaigns")
+async def campaigns(authorization: str | None = Header(default=None)):
+    user = get_telegram_user(authorization)
+    await db.upsert_user(user)
+    rows = await db.list_campaigns_for_user(user["id"])
+    return [{
+        "id": int(r["id"]),
+        "target_members": int(r["target_members"]),
+        "completed_members": int(r["completed_members"]),
+        "reward_per_member": int(r["reward_per_member"]),
+        "link": r["link"],
+        "chat_id": r["chat_id"],
+        "status": r["status"],
+        "payment_method": r["payment_method"],
+    } for r in rows]
+
 @app.post("/api/campaigns")
 async def campaign(body: CampaignBody, authorization: str | None = Header(default=None)):
     user = get_telegram_user(authorization)
@@ -152,11 +168,30 @@ async def campaign(body: CampaignBody, authorization: str | None = Header(defaul
         raise HTTPException(400, "Target must be a multiple of 100")
     if not body.link.startswith("https://t.me/"):
         raise HTTPException(400, "Telegram link required")
+    await verify_bot_is_admin(body.chat_id.strip())
     price = body.target_members * 10
-    campaign_id = await db.create_campaign(user["id"], body.target_members, price, body.link, body.chat_id)
+    campaign_id = await db.create_campaign(user["id"], body.target_members, price, body.link, body.chat_id.strip())
     if campaign_id is None:
         raise HTTPException(400, "Insufficient balance")
-    return {"campaign_id": campaign_id, "price_zibsol": price}
+    return {"campaign_id": campaign_id, "price_zibsol": price, "reward_per_member": db.PROMO_REWARD_PER_MEMBER}
+
+class CampaignClaimBody(BaseModel):
+    campaign_id: int
+
+@app.post("/api/campaigns/claim")
+async def campaign_claim(body: CampaignClaimBody, authorization: str | None = Header(default=None)):
+    user = get_telegram_user(authorization)
+    await db.upsert_user(user)
+    rows = await db.list_campaigns_for_user(user["id"])
+    campaign_row = next((r for r in rows if int(r["id"]) == body.campaign_id), None)
+    if not campaign_row:
+        raise HTTPException(404, "Campaign not found or already complete")
+    if not await verify_user_membership(campaign_row["chat_id"], user["id"]):
+        raise HTTPException(400, "Join the promoted channel first")
+    reward, status = await db.claim_campaign(user["id"], body.campaign_id)
+    if reward is None:
+        raise HTTPException(400, status)
+    return {"reward": reward, "status": status, "balance": await db.get_balance(user["id"])}
 
 class StarCampaignBody(BaseModel):
     target_members: int
@@ -171,8 +206,9 @@ async def campaign_stars(body: StarCampaignBody, authorization: str | None = Hea
         raise HTTPException(400, "Target must be a multiple of 100")
     if not body.link.startswith("https://t.me/"):
         raise HTTPException(400, "Telegram link required")
+    await verify_bot_is_admin(body.chat_id.strip())
     price_stars = (body.target_members // 100) * STARS_PER_100_MEMBERS
-    order_id, payload = await db.create_star_order(user["id"], body.target_members, price_stars, body.link, body.chat_id)
+    order_id, payload = await db.create_star_order(user["id"], body.target_members, price_stars, body.link, body.chat_id.strip())
     invoice = await telegram_api("createInvoiceLink", {
         "title": f"ZIBSOL promo — {body.target_members} users",
         "description": f"Telegram promotion for {body.target_members} users",
@@ -225,6 +261,11 @@ async def admin_status(authorization: str | None = Header(default=None)):
 async def admin_channels(authorization: str | None = Header(default=None)):
     require_admin(authorization)
     return [{"id":r["id"],"chat_id":r["chat_id"],"title":r["title"],"reward":r["reward"],"join_link":r["join_link"],"active":bool(r["active"])} for r in await db.list_channels(False)]
+
+@app.get("/api/admin/campaigns")
+async def admin_campaigns(authorization: str | None = Header(default=None)):
+    require_admin(authorization)
+    return [{"id":int(r["id"]),"user_id":int(r["user_id"]),"target_members":int(r["target_members"]),"completed_members":int(r["completed_members"]),"reward_per_member":int(r["reward_per_member"]),"link":r["link"],"chat_id":r["chat_id"],"status":r["status"],"payment_method":r["payment_method"]} for r in await db.list_campaigns()]
 
 @app.post("/api/admin/channels")
 async def add_channel(body: AddChannelBody, authorization: str | None = Header(default=None)):
