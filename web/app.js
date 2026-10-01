@@ -1,26 +1,162 @@
-const tg=window.Telegram.WebApp;tg.ready();tg.expand();
+const tg=window.Telegram.WebApp;
+tg.ready();
+tg.expand();
 const auth=tg.initData;
 const headers=()=>({"Content-Type":"application/json","Authorization":"tma "+auth});
-async function api(path,options={}){const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),10000);try{const r=await fetch(path,{...options,headers:{...headers(),...(options.headers||{})},signal:controller.signal,cache:"no-store"});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.detail||d.error||`HTTP ${r.status}`);return d}finally{clearTimeout(timer)}}
-function setPage(page){document.querySelectorAll(".page").forEach(x=>x.classList.add("hidden"));const el=document.getElementById(page);if(el)el.classList.remove("hidden");document.querySelectorAll("[data-page]").forEach(x=>x.classList.toggle("active",x.dataset.page===page));if(page==="referrals")loadReferrals();if(page==="admin")loadAdminChannels()}
-async function loadMe(){if(!auth){showChannelsError("Open this Mini App from Telegram.");return null}try{const d=await api("/api/me");document.getElementById("balance").textContent=Number(d.balance).toLocaleString()+" ZIBSOL";document.getElementById("gram").textContent=d.gram+" GRAM";document.getElementById("avatar").textContent=(d.user.first_name||"Z")[0].toUpperCase();if(d.is_admin){document.getElementById("adminTab")?.classList.remove("hidden")}else{document.getElementById("navAdmin")?.classList.add("hidden")}if(d.wallet&&!document.getElementById("wallet").value)document.getElementById("wallet").value=d.wallet;return d}catch(e){console.error("/api/me",e);return null}}
-function showChannelsError(message){const el=document.getElementById("channels");if(el)el.innerHTML=`<div class="info-card"><b>Could not load channels</b><span>${esc(message)}</span><button class="gradient-btn" onclick="loadChannels()">↻ Try again</button></div>`}
-async function loadChannels(){const el=document.getElementById("channels");if(!el)return;el.innerHTML='<div class="info-card"><b>Loading channels…</b><span>Checking available earning tasks.</span></div>';try{const rows=await api("/api/channels");if(!rows.length){el.innerHTML='<div class="info-card"><b>No channels configured yet.</b><span>Come back later for new earning tasks.</span></div>';return}el.innerHTML=rows.map(c=>`<div class="channel"><div class="row"><strong>${esc(c.title)}</strong><strong style="color:#16e6a4">+${Number(c.reward).toLocaleString()}</strong></div><div class="row"><a href="${esc(c.join_link)}" target="_blank">Join channel →</a><button onclick="claim(${c.id})">Verify membership</button></div></div>`).join("")}catch(e){console.error("/api/channels",e);showChannelsError(e.name==="AbortError"?"The server took too long to respond. Try again.":e.message)}}
-async function claim(id){try{const d=await api("/api/channels/claim",{method:"POST",body:JSON.stringify({channel_id:id})});alert("+"+Number(d.reward).toLocaleString()+" ZIBSOL");await loadMe();await loadChannels()}catch(e){alert(e.message)}}
-async function loadReferrals(){try{const d=await api("/api/referral");document.getElementById("refCount").textContent=d.count;document.getElementById("refReward").textContent=Number(d.reward_per_ref).toLocaleString()+" ZIBSOL";document.getElementById("refTotal").textContent=Number(d.total_earned).toLocaleString();document.getElementById("refLink").value=d.link;window.referralLink=d.link}catch(e){document.getElementById("refMsg").textContent=e.message}}
-async function copyReferral(){try{await navigator.clipboard.writeText(window.referralLink);document.getElementById("refMsg").textContent="Referral link copied."}catch(e){document.getElementById("refMsg").textContent="Copy failed. Long-press the link and copy it."}}
-function shareReferral(){const link=window.referralLink;const url="https://t.me/share/url?url="+encodeURIComponent(link)+"&text="+encodeURIComponent("Join ZIBSOL and earn ZIBSOL rewards!");if(tg.openTelegramLink)tg.openTelegramLink(url);else window.open(url,"_blank")}
-async function loadAdminChannels(){try{const rows=await api("/api/admin/channels");document.getElementById("adminChannels").innerHTML=rows.map(c=>`<div class="channel"><div class="row"><strong>${esc(c.title)}</strong><span style="color:#16e6a4">${c.active?"ACTIVE":"OFF"}</span></div><div class="row"><span>${esc(c.chat_id)} · +${Number(c.reward).toLocaleString()}</span>${c.active?`<button onclick="disableChannel(${c.id})">Disable</button>`:""}</div></div>`).join("")||'<p class="muted">No channels.</p>'}catch(e){document.getElementById("adminChannels").textContent=e.message}}
+
+async function api(path,options={}){
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),10000);
+  try{
+    const r=await fetch(path,{...options,headers:{...headers(),...(options.headers||{})},signal:controller.signal,cache:"no-store"});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(d.detail||d.error||`HTTP ${r.status}`);
+    return d;
+  }finally{clearTimeout(timer)}
+}
+
+let currentPage="earn";
+
+function setPage(page){
+  const valid=["earn","referrals","promote","withdraw","admin"];
+  if(!valid.includes(page)) page="earn";
+  currentPage=page;
+  document.querySelectorAll(".page").forEach(x=>x.classList.add("hidden"));
+  const el=document.getElementById(page);
+  if(el) el.classList.remove("hidden");
+  document.querySelectorAll("[data-page]").forEach(x=>x.classList.toggle("active",x.dataset.page===page));
+
+  if(page==="earn"){
+    loadChannels();
+    loadCampaignTasks();
+  }
+  if(page==="referrals") loadReferrals();
+  if(page==="admin") loadAdminChannels();
+  if(page==="withdraw") loadMe();
+
+  try{
+    if(tg.HapticFeedback) tg.HapticFeedback.impactOccurred("light");
+  }catch(e){}
+  window.scrollTo({top:0,behavior:"smooth"});
+}
+
+function initNavigation(){
+  document.querySelectorAll("[data-page]").forEach(button=>{
+    button.addEventListener("click",event=>{
+      event.preventDefault();
+      event.stopPropagation();
+      setPage(button.dataset.page);
+    });
+  });
+
+  if(tg.BackButton){
+    tg.BackButton.onClick(()=>{
+      if(currentPage!=="earn") setPage("earn");
+      else tg.close();
+    });
+  }
+
+  if(tg.onEvent){
+    tg.onEvent("activated",()=>{
+      loadMe();
+      if(currentPage==="earn") loadChannels();
+    });
+  }
+}
+
+async function loadMe(){
+  if(!auth){showChannelsError("Open this Mini App from Telegram.");return null}
+  try{
+    const d=await api("/api/me");
+    document.getElementById("balance").textContent=Number(d.balance).toLocaleString()+" ZIBSOL";
+    document.getElementById("gram").textContent=d.gram+" GRAM";
+    document.getElementById("avatar").textContent=(d.user.first_name||"Z")[0].toUpperCase();
+    if(d.is_admin) document.getElementById("navAdmin")?.classList.remove("hidden");
+    else document.getElementById("navAdmin")?.classList.add("hidden");
+    if(d.wallet&&!document.getElementById("wallet").value) document.getElementById("wallet").value=d.wallet;
+    return d;
+  }catch(e){console.error("/api/me",e);return null}
+}
+
+function showChannelsError(message){
+  const el=document.getElementById("channels");
+  if(el) el.innerHTML=`<div class="info-card"><b>Could not load channels</b><span>${esc(message)}</span><button class="gradient-btn" onclick="loadChannels()">↻ Try again</button></div>`;
+}
+
+async function loadChannels(){
+  const el=document.getElementById("channels");
+  if(!el)return;
+  el.innerHTML='<div class="info-card"><b>Loading channels…</b><span>Checking available earning tasks.</span></div>';
+  try{
+    const rows=await api("/api/channels");
+    if(!rows.length){el.innerHTML='<div class="info-card"><b>No channels configured yet.</b><span>Come back later for new earning tasks.</span></div>';return}
+    el.innerHTML=rows.map(c=>`<div class="channel"><div class="row"><strong>${esc(c.title)}</strong><strong style="color:#16e6a4">+${Number(c.reward).toLocaleString()}</strong></div><div class="row"><a href="${esc(c.join_link)}" target="_blank">Join channel →</a><button onclick="claim(${c.id})">Verify membership</button></div></div>`).join("");
+  }catch(e){console.error("/api/channels",e);showChannelsError(e.name==="AbortError"?"The server took too long to respond. Try again.":e.message)}
+}
+
+async function claim(id){
+  try{const d=await api("/api/channels/claim",{method:"POST",body:JSON.stringify({channel_id:id})});alert("+"+Number(d.reward).toLocaleString()+" ZIBSOL");await loadMe();await loadChannels()}
+  catch(e){alert(e.message)}
+}
+
+async function loadCampaignTasks(){
+  const el=document.getElementById("campaignTasks");
+  if(!el)return;
+  try{
+    const rows=await api("/api/campaigns/tasks");
+    if(!rows.length){el.innerHTML='<div class="info-card"><b>No paid promotions yet.</b><span>New campaigns will appear here.</span></div>';return}
+    el.innerHTML=rows.map(c=>{
+      const target=Number(c.target_members||0), joined=Number(c.joined_members||0);
+      const pct=target?Math.min(100,Math.round(joined/target*100)):0;
+      return `<div class="channel"><div class="row"><strong>${esc(c.title||c.link)}</strong><strong style="color:#16e6a4">+${Number(c.reward_per_member||10).toLocaleString()} ZIBSOL</strong></div><div class="row"><span>${joined} / ${target} verified</span><span>${pct}%</span></div><div class="progress"><i style="width:${pct}%"></i></div><div class="row"><a href="${esc(c.link)}" target="_blank">Join channel →</a><button onclick="claimCampaign(${c.id})">Verify & earn</button></div></div>`;
+    }).join("");
+  }catch(e){console.error("/api/campaigns/tasks",e);el.innerHTML='<div class="info-card"><b>Promotions unavailable</b><span>Try again later.</span></div>'}
+}
+
+async function claimCampaign(id){
+  try{const d=await api("/api/campaigns/claim",{method:"POST",body:JSON.stringify({campaign_id:id})});alert("+"+Number(d.reward).toLocaleString()+" ZIBSOL");await loadMe();await loadCampaignTasks()}
+  catch(e){alert(e.message)}
+}
+
+async function loadReferrals(){
+  try{const d=await api("/api/referral");document.getElementById("refCount").textContent=d.count;document.getElementById("refReward").textContent=Number(d.reward_per_ref).toLocaleString()+" ZIBSOL";document.getElementById("refTotal").textContent=Number(d.total_earned).toLocaleString();document.getElementById("refLink").value=d.link;window.referralLink=d.link}
+  catch(e){document.getElementById("refMsg").textContent=e.message}
+}
+
+async function copyReferral(){
+  try{await navigator.clipboard.writeText(window.referralLink);document.getElementById("refMsg").textContent="Referral link copied."}
+  catch(e){document.getElementById("refMsg").textContent="Copy failed. Long-press the link and copy it."}
+}
+
+function shareReferral(){
+  const link=window.referralLink;
+  const url="https://t.me/share/url?url="+encodeURIComponent(link)+"&text="+encodeURIComponent("Join ZIBSOL and earn ZIBSOL rewards!");
+  if(tg.openTelegramLink)tg.openTelegramLink(url);else window.open(url,"_blank")
+}
+
+async function loadAdminChannels(){
+  try{const rows=await api("/api/admin/channels");document.getElementById("adminChannels").innerHTML=rows.map(c=>`<div class="channel"><div class="row"><strong>${esc(c.title)}</strong><span style="color:#16e6a4">${c.active?"ACTIVE":"OFF"}</span></div><div class="row"><span>${esc(c.chat_id)} · +${Number(c.reward).toLocaleString()}</span>${c.active?`<button onclick="disableChannel(${c.id})">Disable</button>`:""}</div></div>`).join("")||'<p class="muted">No channels.</p>'}
+  catch(e){document.getElementById("adminChannels").textContent=e.message}
+}
+
 async function disableChannel(id){try{await api("/api/admin/channels/disable",{method:"POST",body:JSON.stringify({channel_id:id})});await loadAdminChannels();await loadChannels()}catch(e){alert(e.message)}}
+
 function campaignInput(){return {target_members:Number(document.getElementById("target").value),link:document.getElementById("promoLink").value.trim(),chat_id:document.getElementById("promoChat").value.trim()}}
 function updateCampaignPrice(){const target=Number(document.getElementById("target").value||0);const zib=target*10;const stars=target>=100&&target%100===0?(target/100)*10:0;document.getElementById("price").textContent=`${zib.toLocaleString()} ZIBSOL · ${stars?stars.toLocaleString():"—"} ⭐`}
+
 document.getElementById("target").oninput=updateCampaignPrice;
-document.getElementById("createCampaign").onclick=async()=>{try{const d=await api("/api/campaigns",{method:"POST",body:JSON.stringify(campaignInput())});document.getElementById("promoMsg").textContent="Campaign #"+d.campaign_id+" created with ZIBSOL.";await loadMe()}catch(e){document.getElementById("promoMsg").textContent=e.message}};
-document.getElementById("createStarsCampaign").onclick=async()=>{try{const data=campaignInput();const d=await api("/api/campaigns/stars",{method:"POST",body:JSON.stringify(data)});document.getElementById("promoMsg").textContent=`Invoice ready: ${d.price_stars} Telegram Stars.`;if(tg.openInvoice){tg.openInvoice(d.invoice_link,(status)=>{if(status==="paid"){document.getElementById("promoMsg").textContent="✅ Stars payment received. Promotion queued.";}})}else if(tg.openTelegramLink){tg.openTelegramLink(d.invoice_link)}else{window.open(d.invoice_link,"_blank")}}catch(e){document.getElementById("promoMsg").textContent=e.message}};
+document.getElementById("createCampaign").onclick=async()=>{try{const d=await api("/api/campaigns",{method:"POST",body:JSON.stringify(campaignInput())});document.getElementById("promoMsg").textContent="Campaign #"+d.campaign_id+" created with ZIBSOL.";await loadMe();await loadCampaignTasks()}catch(e){document.getElementById("promoMsg").textContent=e.message}};
+document.getElementById("createStarsCampaign").onclick=async()=>{try{const data=campaignInput();const d=await api("/api/campaigns/stars",{method:"POST",body:JSON.stringify(data)});document.getElementById("promoMsg").textContent=`Invoice ready: ${d.price_stars} Telegram Stars.`;if(tg.openInvoice){tg.openInvoice(d.invoice_link,(status)=>{if(status==="paid"){document.getElementById("promoMsg").textContent="✅ Stars payment received. Promotion queued.";loadCampaignTasks()}})}else if(tg.openTelegramLink){tg.openTelegramLink(d.invoice_link)}else{window.open(d.invoice_link,"_blank")}}catch(e){document.getElementById("promoMsg").textContent=e.message}};
 document.getElementById("withdrawBtn").onclick=async()=>{try{const d=await api("/api/withdraw",{method:"POST",body:JSON.stringify({wallet:document.getElementById("wallet").value.trim()})});document.getElementById("withdrawMsg").textContent=`Withdrawal #${d.withdrawal_id}: ${d.gram} GRAM requested.`;await loadMe()}catch(e){document.getElementById("withdrawMsg").textContent=e.message}};
 document.getElementById("addChannel").onclick=async()=>{const msg=document.getElementById("adminMsg");msg.textContent="Checking Telegram…";try{const d=await api("/api/admin/channels",{method:"POST",body:JSON.stringify({chat_id:document.getElementById("adminChatId").value.trim(),join_link:document.getElementById("adminJoinLink").value.trim(),reward:Number(document.getElementById("adminReward").value),title:document.getElementById("adminTitle").value.trim()||null})});msg.textContent=`Added ${d.title} — +${Number(d.reward).toLocaleString()} ZIBSOL`;await loadAdminChannels();await loadChannels()}catch(e){msg.textContent=e.message}};
-document.getElementById("copyRef").onclick=copyReferral;document.getElementById("shareRef").onclick=shareReferral;
+document.getElementById("copyRef").onclick=copyReferral;
+document.getElementById("shareRef").onclick=shareReferral;
+
 let tonUI=null;
-function initTonConnect(){try{if(!window.TON_CONNECT_UI?.TonConnectUI)return;tonUI=new TON_CONNECT_UI.TonConnectUI({manifestUrl:location.origin+"/tonconnect-manifest.json",buttonRootId:"ton-connect"});tonUI.onStatusChange(async wallet=>{if(!wallet)return;let address=wallet.account.address;try{if(window.TON_CONNECT_UI.toUserFriendlyAddress)address=window.TON_CONNECT_UI.toUserFriendlyAddress(address);}catch(e){}document.getElementById("wallet").value=address;try{await api("/api/wallet",{method:"POST",body:JSON.stringify({wallet:address})});document.getElementById("withdrawMsg").textContent="✅ TON/GRAM wallet connected."}catch(e){document.getElementById("withdrawMsg").textContent=e.message}})}catch(e){console.error("TON Connect",e)}}
+function initTonConnect(){try{if(!window.TON_CONNECT_UI?.TonConnectUI)return;tonUI=new TON_CONNECT_UI.TonConnectUI({manifestUrl:location.origin+"/tonconnect-manifest.json",buttonRootId:"ton-connect"});tonUI.onStatusChange(async wallet=>{if(!wallet)return;let address=wallet.account.address;try{if(window.TON_CONNECT_UI.toUserFriendlyAddress)address=window.TON_CONNECT_UI.toUserFriendlyAddress(address)}catch(e){}document.getElementById("wallet").value=address;try{await api("/api/wallet",{method:"POST",body:JSON.stringify({wallet:address})});document.getElementById("withdrawMsg").textContent="✅ TON/GRAM wallet connected."}catch(e){document.getElementById("withdrawMsg").textContent=e.message}})}catch(e){console.error("TON Connect",e)}}
+
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-loadMe().then(()=>{loadChannels();loadReferrals();updateCampaignPrice();initTonConnect()});
+
+initNavigation();
+setPage("earn");
+loadMe().then(()=>{loadChannels();loadCampaignTasks();loadReferrals();updateCampaignPrice();initTonConnect()});
