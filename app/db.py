@@ -3,6 +3,7 @@ import uuid
 import asyncpg
 
 REFERRAL_REWARD = 1000
+PROMO_REWARD_PER_MEMBER = int(os.getenv("PROMO_REWARD_PER_MEMBER", "10"))
 DATABASE_URL = os.environ.get("DATABASE_URL")
 _pool = None
 
@@ -47,11 +48,22 @@ async def init_db():
             payment_method TEXT NOT NULL DEFAULT 'zibsol',
             price_stars BIGINT NOT NULL DEFAULT 0,
             stars_charge_id TEXT,
+            completed_members INTEGER NOT NULL DEFAULT 0,
+            reward_per_member BIGINT NOT NULL DEFAULT 10,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT 'zibsol';
         ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS price_stars BIGINT NOT NULL DEFAULT 0;
         ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS stars_charge_id TEXT;
+        ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS completed_members INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS reward_per_member BIGINT NOT NULL DEFAULT 10;
+        CREATE TABLE IF NOT EXISTS campaign_participants (
+            campaign_id BIGINT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+            user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            reward BIGINT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (campaign_id, user_id)
+        );
         CREATE TABLE IF NOT EXISTS star_orders (
             id BIGSERIAL PRIMARY KEY,
             user_id BIGINT NOT NULL REFERENCES users(id),
@@ -90,6 +102,8 @@ async def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_user_id);
         CREATE INDEX IF NOT EXISTS idx_star_orders_payload ON star_orders(payload);
+        CREATE INDEX IF NOT EXISTS idx_campaigns_status ON campaigns(status);
+        CREATE INDEX IF NOT EXISTS idx_campaign_participants_user ON campaign_participants(user_id);
         ''')
 
 async def close_db():
@@ -168,7 +182,8 @@ async def create_campaign(user_id, target, price, link, chat_id):
             balance = await db.fetchval("SELECT balance FROM users WHERE id=$1 FOR UPDATE", user_id)
             if balance is None or balance < price: return None
             await db.execute("UPDATE users SET balance=balance-$1 WHERE id=$2", price,user_id)
-            row = await db.fetchrow("INSERT INTO campaigns(user_id,target_members,price_zibsol,link,chat_id,payment_method,status) VALUES($1,$2,$3,$4,$5,'zibsol','pending') RETURNING id", user_id,target,price,link,chat_id)
+            row = await db.fetchrow("""INSERT INTO campaigns(user_id,target_members,price_zibsol,link,chat_id,status,payment_method,reward_per_member)
+            VALUES($1,$2,$3,$4,$5,'pending','zibsol',$6) RETURNING id""", user_id,target,price,link,chat_id,PROMO_REWARD_PER_MEMBER)
             cid = int(row["id"])
             await db.execute("INSERT INTO ledger(user_id,amount,reason,reference) VALUES($1,$2,$3,$4)", user_id,-price,"promotion_purchase",str(cid))
             return cid
@@ -190,11 +205,43 @@ async def complete_star_order(payload, telegram_user_id, charge_id):
             order = await db.fetchrow("SELECT * FROM star_orders WHERE payload=$1 FOR UPDATE", payload)
             if not order or int(order["user_id"]) != int(telegram_user_id): return None
             if order["status"] == "paid": return int(order["campaign_id"]) if order["campaign_id"] else None
-            campaign = await db.fetchrow("""INSERT INTO campaigns(user_id,target_members,price_zibsol,link,chat_id,status,payment_method,price_stars,stars_charge_id)
-            VALUES($1,$2,0,$3,$4,'pending','stars',$5,$6) RETURNING id""", order["user_id"],order["target_members"],order["link"],order["chat_id"],order["price_stars"],charge_id)
+            campaign = await db.fetchrow("""INSERT INTO campaigns(user_id,target_members,price_zibsol,link,chat_id,status,payment_method,price_stars,stars_charge_id,reward_per_member)
+            VALUES($1,$2,0,$3,$4,'pending','stars',$5,$6,$7) RETURNING id""", order["user_id"],order["target_members"],order["link"],order["chat_id"],order["price_stars"],charge_id,PROMO_REWARD_PER_MEMBER)
             cid = int(campaign["id"])
             await db.execute("UPDATE star_orders SET status='paid',campaign_id=$1,telegram_charge_id=$2,paid_at=NOW() WHERE id=$3", cid,charge_id,order["id"])
             return cid
+
+async def list_campaigns_for_user(user_id):
+    async with pool().acquire() as db:
+        return await db.fetch("""SELECT c.id,c.title,c.target_members,c.completed_members,c.reward_per_member,c.link,c.chat_id,c.status,c.payment_method
+        FROM (SELECT id, target_members, completed_members, reward_per_member, link, chat_id, status, payment_method, NULL::TEXT AS title, user_id FROM campaigns) c
+        WHERE c.status='pending' AND c.completed_members < c.target_members AND c.user_id <> $1
+        ORDER BY c.id DESC LIMIT 50""", user_id)
+
+async def list_campaigns():
+    async with pool().acquire() as db:
+        return await db.fetch("SELECT id,user_id,target_members,completed_members,reward_per_member,link,chat_id,status,payment_method,created_at FROM campaigns ORDER BY id DESC LIMIT 100")
+
+async def claim_campaign(user_id, campaign_id):
+    async with pool().acquire() as db:
+        async with db.transaction():
+            campaign = await db.fetchrow("SELECT * FROM campaigns WHERE id=$1 FOR UPDATE", campaign_id)
+            if not campaign or campaign["status"] != "pending" or int(campaign["completed_members"]) >= int(campaign["target_members"]):
+                return None, "Campaign is not available"
+            if int(campaign["user_id"]) == int(user_id):
+                return None, "You cannot join your own promotion"
+            already = await db.fetchval("SELECT EXISTS(SELECT 1 FROM campaign_participants WHERE campaign_id=$1 AND user_id=$2)", campaign_id, user_id)
+            if already:
+                return None, "You already completed this promotion"
+            reward = int(campaign["reward_per_member"])
+            if reward > 0:
+                await db.execute("UPDATE users SET balance=balance+$1 WHERE id=$2", reward, user_id)
+                await db.execute("INSERT INTO ledger(user_id,amount,reason,reference) VALUES($1,$2,$3,$4)", user_id,reward,"campaign_join",str(campaign_id))
+            await db.execute("INSERT INTO campaign_participants(campaign_id,user_id,reward) VALUES($1,$2,$3)", campaign_id,user_id,reward)
+            completed = int(campaign["completed_members"]) + 1
+            status = "completed" if completed >= int(campaign["target_members"]) else "pending"
+            await db.execute("UPDATE campaigns SET completed_members=$1,status=$2 WHERE id=$3", completed,status,campaign_id)
+            return reward, status
 
 async def create_withdrawal(user_id, wallet):
     async with pool().acquire() as db:
