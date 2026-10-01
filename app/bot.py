@@ -48,6 +48,10 @@ async def referrals(message: Message):
     count = await db.referral_count(message.from_user.id)
     await message.answer(f"👥 Referrals: {count}\n💰 Reward: {count * db.REFERRAL_REWARD:,} ZIBSOL")
 
+@router.message(F.text == "/paysupport")
+async def paysupport(message: Message):
+    await message.answer("💳 ZIBSOL payment support\n\nFor a Telegram Stars payment issue, send your Telegram username, order/campaign number, and a short description of the problem.")
+
 @router.pre_checkout_query()
 async def pre_checkout(query: PreCheckoutQuery):
     order = await db.get_star_order_by_payload(query.invoice_payload)
