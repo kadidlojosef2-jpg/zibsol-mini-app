@@ -17,6 +17,7 @@ app = FastAPI(title="ZIBSOL Mini App API")
 app.mount("/static", StaticFiles(directory=WEB), name="static")
 ZIBSOL_PER_GRAM = 10000
 MIN_WITHDRAWAL = 10000
+STARS_PER_100_MEMBERS = 10
 _bot_task = None
 
 @app.on_event("startup")
@@ -40,6 +41,14 @@ async def shutdown():
 @app.get("/")
 async def home():
     return FileResponse(WEB / "index.html")
+
+@app.get("/tonconnect-manifest.json")
+async def tonconnect_manifest():
+    return {
+        "url": os.getenv("APP_URL", "https://zibsol-mini-app.onrender.com"),
+        "name": "ZIBSOL",
+        "iconUrl": os.getenv("TON_ICON_URL", "https://ton.org/download/ton_symbol.png")
+    }
 
 @app.get("/health")
 async def health():
@@ -96,7 +105,7 @@ async def me(authorization: str | None = Header(default=None)):
     user = get_telegram_user(authorization)
     await db.upsert_user(user)
     balance = await db.get_balance(user["id"])
-    return {"user": user, "balance": balance, "gram": str(Decimal(balance) / ZIBSOL_PER_GRAM), "is_admin": user["id"] in admin_ids()}
+    return {"user": user, "balance": balance, "gram": str(Decimal(balance) / ZIBSOL_PER_GRAM), "is_admin": user["id"] in admin_ids(), "wallet": await db.get_wallet(user["id"])}
 
 @app.get("/api/referral")
 async def referral(authorization: str | None = Header(default=None)):
@@ -149,6 +158,43 @@ async def campaign(body: CampaignBody, authorization: str | None = Header(defaul
         raise HTTPException(400, "Insufficient balance")
     return {"campaign_id": campaign_id, "price_zibsol": price}
 
+class StarCampaignBody(BaseModel):
+    target_members: int
+    link: str
+    chat_id: str
+
+@app.post("/api/campaigns/stars")
+async def campaign_stars(body: StarCampaignBody, authorization: str | None = Header(default=None)):
+    user = get_telegram_user(authorization)
+    await db.upsert_user(user)
+    if body.target_members < 100 or body.target_members % 100:
+        raise HTTPException(400, "Target must be a multiple of 100")
+    if not body.link.startswith("https://t.me/"):
+        raise HTTPException(400, "Telegram link required")
+    price_stars = (body.target_members // 100) * STARS_PER_100_MEMBERS
+    order_id, payload = await db.create_star_order(user["id"], body.target_members, price_stars, body.link, body.chat_id)
+    invoice = await telegram_api("createInvoiceLink", {
+        "title": f"ZIBSOL promo — {body.target_members} users",
+        "description": f"Telegram promotion for {body.target_members} users",
+        "payload": payload,
+        "currency": "XTR",
+        "prices": [{"label": "Promotion", "amount": price_stars}]
+    })
+    return {"order_id": order_id, "price_stars": price_stars, "invoice_link": invoice}
+
+class WalletBody(BaseModel):
+    wallet: str
+
+@app.post("/api/wallet")
+async def wallet(body: WalletBody, authorization: str | None = Header(default=None)):
+    user = get_telegram_user(authorization)
+    await db.upsert_user(user)
+    value = body.wallet.strip()
+    if not value:
+        raise HTTPException(400, "Wallet address is required")
+    await db.set_wallet(user["id"], value)
+    return {"ok": True, "wallet": value}
+
 class WithdrawBody(BaseModel):
     wallet: str
 
@@ -156,10 +202,13 @@ class WithdrawBody(BaseModel):
 async def withdraw(body: WithdrawBody, authorization: str | None = Header(default=None)):
     user = get_telegram_user(authorization)
     await db.upsert_user(user)
-    withdrawal_id = await db.create_withdrawal(user["id"], body.wallet)
+    wallet = body.wallet.strip() or await db.get_wallet(user["id"])
+    if not wallet:
+        raise HTTPException(400, "Connect or enter a TON/GRAM wallet first")
+    withdrawal_id = await db.create_withdrawal(user["id"], wallet)
     if withdrawal_id is None:
         raise HTTPException(400, f"Minimum withdrawal is {MIN_WITHDRAWAL:,} ZIBSOL")
-    return {"withdrawal_id": withdrawal_id}
+    return {"withdrawal_id": withdrawal_id, "amount_zibsol": MIN_WITHDRAWAL, "gram": str(Decimal(MIN_WITHDRAWAL) / ZIBSOL_PER_GRAM), "wallet": wallet}
 
 class AddChannelBody(BaseModel):
     chat_id: str
