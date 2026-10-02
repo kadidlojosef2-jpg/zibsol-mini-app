@@ -63,6 +63,11 @@ async def me(authorization:str|None=Header(default=None)):
 async def referral(authorization:str|None=Header(default=None)):
  user=get_telegram_user(authorization); await db.upsert_user(user); bot=await telegram_api("getMe",{}); count=await db.referral_count(user["id"]); reward=db.REFERRAL_REWARD
  return {"count":count,"reward_per_ref":reward,"total_earned":count*reward,"link":f"https://t.me/{bot['username']}?start=ref_{user['id']}"}
+@app.post("/api/ads/reward")
+async def ad_reward(authorization:str|None=Header(default=None)):
+ user=get_telegram_user(authorization); await db.upsert_user(user); balance,remaining=await db.reward_ad(user["id"])
+ if balance is None: raise HTTPException(429,f"You can watch another rewarded ad in {remaining} seconds")
+ return {"ok":True,"reward":db.AD_REWARD,"balance":balance,"cooldown":db.AD_COOLDOWN_SECONDS}
 @app.get("/api/channels")
 async def channels(authorization:str|None=Header(default=None)):
  user=get_telegram_user(authorization); await db.upsert_user(user); return [{"id":r["id"],"chat_id":r["chat_id"],"title":r["title"],"reward":r["reward"],"join_link":r["join_link"]} for r in await db.list_channels(True)]
@@ -141,8 +146,6 @@ async def disable_channel(body:DisableChannelBody,authorization:str|None=Header(
  require_admin(authorization)
  if not await db.deactivate_channel(body.channel_id): raise HTTPException(404,"Channel not found")
  return {"ok":True}
-
-# Developer dashboard
 @app.get("/api/developer/stats")
 async def developer_stats(authorization:str|None=Header(default=None)):
  require_admin(authorization); r=await db.developer_stats(); return {"users":int(r["users"]),"circulating":int(r["circulating"]),"pending_withdrawals":int(r["pending_withdrawals"]),"active_campaigns":int(r["active_campaigns"])}
