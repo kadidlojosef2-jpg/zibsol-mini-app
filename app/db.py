@@ -5,7 +5,7 @@ import asyncpg
 REFERRAL_REWARD = 1000
 PROMO_REWARD_PER_MEMBER = int(os.getenv("PROMO_REWARD_PER_MEMBER", "100"))
 AD_REWARD = 50
-AD_COOLDOWN_SECONDS = 60
+AD_COOLDOWN_SECONDS = 10
 DATABASE_URL = os.environ.get("DATABASE_URL")
 _pool = None
 
@@ -158,16 +158,19 @@ async def developer_withdrawals():
         return await db.fetch("SELECT w.id,w.user_id,u.username,u.first_name,w.amount,w.wallet,w.status,w.created_at FROM withdrawals w JOIN users u ON u.id=w.user_id ORDER BY CASE WHEN w.status='pending' THEN 0 ELSE 1 END,w.id DESC LIMIT 200")
 async def approve_withdrawal(withdrawal_id):
     async with pool().acquire() as db:
-        row=await db.fetchrow("UPDATE withdrawals SET status='approved' WHERE id=$1 AND status='pending' RETURNING id,user_id,amount,wallet",withdrawal_id); return row
+        return await db.fetchrow("UPDATE withdrawals SET status='approved' WHERE id=$1 AND status='pending' RETURNING id,amount,wallet",withdrawal_id)
 async def reject_withdrawal(withdrawal_id):
     async with pool().acquire() as db:
         async with db.transaction():
             row=await db.fetchrow("UPDATE withdrawals SET status='rejected' WHERE id=$1 AND status='pending' RETURNING id,user_id,amount",withdrawal_id)
             if not row:return None
-            await db.execute("UPDATE users SET balance=balance+$1 WHERE id=$2",row["amount"],row["user_id"]); await db.execute("INSERT INTO ledger(user_id,amount,reason,reference) VALUES($1,$2,$3,$4)",row["user_id"],row["amount"],"withdrawal_rejected_refund",str(withdrawal_id)); return row
+            await db.execute("UPDATE users SET balance=balance+$1 WHERE id=$2",int(row["amount"]),int(row["user_id"]))
+            await db.execute("INSERT INTO ledger(user_id,amount,reason,reference) VALUES($1,$2,$3,$4)",int(row["user_id"]),int(row["amount"]),"withdrawal_refund",str(withdrawal_id))
+            return row
 async def grant_zibsol(user_id,amount,reason):
     async with pool().acquire() as db:
         async with db.transaction():
-            exists=await db.fetchval("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1)",user_id)
-            if not exists:return None
-            await db.execute("UPDATE users SET balance=balance+$1 WHERE id=$2",amount,user_id); await db.execute("INSERT INTO ledger(user_id,amount,reason,reference) VALUES($1,$2,$3,$4)",user_id,amount,reason,"developer_grant"); return await db.fetchval("SELECT balance FROM users WHERE id=$1",user_id)
+            if not await db.fetchval("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1)",user_id):return None
+            await db.execute("UPDATE users SET balance=balance+$1 WHERE id=$2",amount,user_id)
+            await db.execute("INSERT INTO ledger(user_id,amount,reason,reference) VALUES($1,$2,$3,$4)",user_id,amount,"admin_grant",reason)
+            return await db.fetchval("SELECT balance FROM users WHERE id=$1",user_id)
