@@ -1,6 +1,8 @@
 import asyncio
 import json
+import logging
 import os
+from urllib.parse import parse_qsl
 from decimal import Decimal
 from pathlib import Path
 import httpx
@@ -11,13 +13,15 @@ from pydantic import BaseModel, Field
 from .telegram_auth import validate_init_data
 from . import db
 BASE=Path(__file__).resolve().parent.parent; WEB=BASE/"web"; app=FastAPI(title="ZIBSOL Mini App API"); app.mount("/static",StaticFiles(directory=WEB),name="static")
-ZIBSOL_PER_GRAM=10000; MIN_WITHDRAWAL=10000; STARS_PER_100_MEMBERS=10; _bot_task=None
+ZIBSOL_PER_GRAM=10000; MIN_WITHDRAWAL=10000; STARS_PER_100_MEMBERS=10; _bot_task=None; _bot_username=None; log=logging.getLogger("zibsol")
+def _bot_done(task):
+ if not task.cancelled() and task.exception(): log.error("Telegram bot polling stopped: %r",task.exception())
 @app.on_event("startup")
 async def startup():
  global _bot_task
  await db.init_db()
  from .bot import run_bot
- _bot_task=asyncio.create_task(run_bot())
+ _bot_task=asyncio.create_task(run_bot()); _bot_task.add_done_callback(_bot_done)
 @app.on_event("shutdown")
 async def shutdown():
  global _bot_task
@@ -36,6 +40,13 @@ def get_telegram_user(authorization):
  if not authorization or not authorization.startswith("tma "): raise HTTPException(401,"Open this app inside Telegram")
  try: return json.loads(validate_init_data(authorization[4:])["user"])
  except Exception as exc: raise HTTPException(401,str(exc))
+def get_start_param(authorization):
+ try: return dict(parse_qsl(authorization[4:])).get("start_param")
+ except Exception: return None
+async def bot_username():
+ global _bot_username
+ if not _bot_username: _bot_username=(await telegram_api("getMe",{}))["username"]
+ return _bot_username
 def admin_ids(): return {int(x.strip()) for x in os.getenv("ADMIN_IDS","").split(",") if x.strip().isdigit()}
 def require_admin(authorization):
  user=get_telegram_user(authorization)
@@ -57,16 +68,22 @@ async def verify_user_membership(chat_id,user_id):
  return status in {"creator","administrator","member"} or (status=="restricted" and member.get("is_member") is True)
 @app.get("/api/me")
 async def me(authorization:str|None=Header(default=None)):
- user=get_telegram_user(authorization); await db.upsert_user(user); balance=await db.get_balance(user["id"])
+ user=get_telegram_user(authorization); was_new=not await db.user_exists(user["id"]); await db.upsert_user(user)
+ sp=get_start_param(authorization)
+ if was_new and sp and sp.startswith("ref_"):
+  try: await db.apply_referral(int(sp[4:]),user["id"])
+  except ValueError: pass
+ balance=await db.get_balance(user["id"])
  return {"user":user,"balance":balance,"gram":str(Decimal(balance)/ZIBSOL_PER_GRAM),"is_admin":user["id"] in admin_ids(),"wallet":await db.get_wallet(user["id"])}
 @app.get("/api/referral")
 async def referral(authorization:str|None=Header(default=None)):
- user=get_telegram_user(authorization); await db.upsert_user(user); bot=await telegram_api("getMe",{}); count=await db.referral_count(user["id"]); reward=db.REFERRAL_REWARD
- return {"count":count,"reward_per_ref":reward,"total_earned":count*reward,"link":f"https://t.me/{bot['username']}?start=ref_{user['id']}"}
+ user=get_telegram_user(authorization); await db.upsert_user(user); uname=await bot_username(); count=await db.referral_count(user["id"]); reward=db.REFERRAL_REWARD; short=os.getenv("MINIAPP_SHORT_NAME","").strip()
+ link=f"https://t.me/{uname}/{short}?startapp=ref_{user['id']}" if short else f"https://t.me/{uname}?start=ref_{user['id']}"
+ return {"count":count,"reward_per_ref":reward,"total_earned":count*reward,"link":link}
 @app.post("/api/ads/reward")
 async def ad_reward(authorization:str|None=Header(default=None)):
  user=get_telegram_user(authorization); await db.upsert_user(user); balance,remaining=await db.reward_ad(user["id"])
- if balance is None: raise HTTPException(429,f"You can watch another rewarded ad in {remaining} seconds")
+ if balance is None: raise HTTPException(429,f"Ad limit reached. Try again in {remaining} seconds" if remaining>=3600 else f"You can watch another rewarded ad in {remaining} seconds")
  return {"ok":True,"reward":db.AD_REWARD,"balance":balance,"cooldown":db.AD_COOLDOWN_SECONDS}
 @app.get("/api/channels")
 async def channels(authorization:str|None=Header(default=None)):
@@ -122,9 +139,9 @@ class WithdrawBody(BaseModel): wallet:str
 async def withdraw(body:WithdrawBody,authorization:str|None=Header(default=None)):
  user=get_telegram_user(authorization); await db.upsert_user(user); wallet=body.wallet.strip() or await db.get_wallet(user["id"])
  if not wallet: raise HTTPException(400,"Connect or enter a TON/GRAM wallet first")
- wid=await db.create_withdrawal(user["id"],wallet)
+ wid,amount=await db.create_withdrawal(user["id"],wallet)
  if wid is None: raise HTTPException(400,f"Minimum withdrawal is {MIN_WITHDRAWAL:,} ZIBSOL")
- return {"withdrawal_id":wid,"amount_zibsol":MIN_WITHDRAWAL,"gram":str(Decimal(MIN_WITHDRAWAL)/ZIBSOL_PER_GRAM),"wallet":wallet}
+ return {"withdrawal_id":wid,"amount_zibsol":amount,"gram":str(Decimal(amount)/ZIBSOL_PER_GRAM),"wallet":wallet}
 class AddChannelBody(BaseModel): chat_id:str; join_link:str; reward:int=Field(default=100,ge=1,le=1000000000); title:str|None=None
 @app.get("/api/admin/status")
 async def admin_status(authorization:str|None=Header(default=None)):
@@ -166,9 +183,16 @@ async def reject_withdrawal(body:WithdrawalAction,authorization:str|None=Header(
  require_admin(authorization); r=await db.reject_withdrawal(body.withdrawal_id)
  if not r: raise HTTPException(404,"Pending withdrawal not found")
  return {"ok":True,"refunded":int(r["amount"])}
+async def notify_grant(user_id,amount,reason,balance):
+ text=f"🎁 You received {amount:,} ZIBSOL!\n\n📝 Reason: {reason}\n💰 New balance: {balance:,} ZIBSOL"
+ try:
+  await telegram_api("sendMessage",{"chat_id":user_id,"text":text}); return True
+ except Exception as exc:
+  log.warning("Could not notify user %s about grant: %r",user_id,exc); return False
 class GrantBody(BaseModel): user_id:int; amount:int=Field(gt=0,le=1000000000); reason:str=Field(min_length=1,max_length=200)
 @app.post("/api/developer/grant")
 async def grant(body:GrantBody,authorization:str|None=Header(default=None)):
  require_admin(authorization); balance=await db.grant_zibsol(body.user_id,body.amount,body.reason)
  if balance is None: raise HTTPException(404,"User not found")
- return {"ok":True,"user_id":body.user_id,"added":body.amount,"balance":int(balance)}
+ notified=await notify_grant(body.user_id,body.amount,body.reason.strip(),int(balance))
+ return {"ok":True,"user_id":body.user_id,"added":body.amount,"balance":int(balance),"notified":notified}
