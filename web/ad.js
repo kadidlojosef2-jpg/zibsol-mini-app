@@ -1,9 +1,46 @@
 (function(){
   const btn=document.getElementById('watchAdBtn');
   const msg=document.getElementById('adMsg');
-  if(!btn) return;
   let busy=false;
+
+  // Monetag In-App Interstitial.
+  // This is a normal ad format and does NOT grant ZIBSOL.
+  // Monetag controls the frequency/capping/interval/session behavior.
+  function startInAppInterstitial(){
+    if(typeof window.show_11933619!=='function') return false;
+    try{
+      window.show_11933619({
+        type:'inApp',
+        inAppSettings:{
+          frequency:2,
+          capping:0.1,
+          interval:30,
+          timeout:5,
+          everyPage:false
+        }
+      });
+      return true;
+    }catch(e){
+      console.warn('Monetag in-app interstitial could not start:',e);
+      return false;
+    }
+  }
+
+  // The SDK can load asynchronously, so retry briefly until it is ready.
+  function initInterstitial(){
+    if(startInAppInterstitial()) return;
+    let attempts=0;
+    const timer=setInterval(function(){
+      attempts++;
+      if(startInAppInterstitial() || attempts>=20) clearInterval(timer);
+    },500);
+  }
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',initInterstitial,{once:true});
+  else initInterstitial();
+
+  if(!btn) return;
   function text(v){if(msg)msg.textContent=v;}
+
   btn.addEventListener('click',async function(){
     if(busy)return;
     if(typeof window.show_11933619!=='function'){
