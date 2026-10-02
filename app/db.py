@@ -4,6 +4,8 @@ import asyncpg
 
 REFERRAL_REWARD = 1000
 PROMO_REWARD_PER_MEMBER = int(os.getenv("PROMO_REWARD_PER_MEMBER", "100"))
+AD_REWARD = 50
+AD_COOLDOWN_SECONDS = 60
 DATABASE_URL = os.environ.get("DATABASE_URL")
 _pool = None
 
@@ -31,6 +33,7 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS withdrawals (id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id), amount BIGINT NOT NULL, wallet TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
         CREATE TABLE IF NOT EXISTS ledger (id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id), amount BIGINT NOT NULL, reason TEXT NOT NULL, reference TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
         CREATE TABLE IF NOT EXISTS referrals (referred_user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, referrer_user_id BIGINT NOT NULL REFERENCES users(id), reward BIGINT NOT NULL DEFAULT 1000, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+        CREATE TABLE IF NOT EXISTS ad_reward_claims (user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, last_claimed_at TIMESTAMPTZ NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_user_id);
         CREATE INDEX IF NOT EXISTS idx_star_orders_payload ON star_orders(payload);
         CREATE INDEX IF NOT EXISTS idx_campaigns_status ON campaigns(status);
@@ -61,6 +64,21 @@ async def get_wallet(user_id):
     async with pool().acquire() as db: return await db.fetchval("SELECT wallet_address FROM users WHERE id=$1",user_id)
 async def set_wallet(user_id,wallet_address):
     async with pool().acquire() as db: await db.execute("UPDATE users SET wallet_address=$1 WHERE id=$2",wallet_address,user_id)
+
+async def reward_ad(user_id):
+    async with pool().acquire() as db:
+        async with db.transaction():
+            row=await db.fetchrow("SELECT last_claimed_at FROM ad_reward_claims WHERE user_id=$1 FOR UPDATE", user_id)
+            if row:
+                seconds=await db.fetchval("SELECT EXTRACT(EPOCH FROM (NOW()-$1::timestamptz))", row["last_claimed_at"])
+                if float(seconds) < AD_COOLDOWN_SECONDS:
+                    remaining=max(1, int(AD_COOLDOWN_SECONDS-float(seconds)))
+                    return None, remaining
+            await db.execute("INSERT INTO ad_reward_claims(user_id,last_claimed_at) VALUES($1,NOW()) ON CONFLICT(user_id) DO UPDATE SET last_claimed_at=NOW()", user_id)
+            await db.execute("UPDATE users SET balance=balance+$1 WHERE id=$2", AD_REWARD, user_id)
+            await db.execute("INSERT INTO ledger(user_id,amount,reason,reference) VALUES($1,$2,$3,$4)", user_id, AD_REWARD, "ad_reward", "monetag:11933619")
+            balance=await db.fetchval("SELECT balance FROM users WHERE id=$1", user_id)
+            return int(balance), 0
 
 async def list_channels(active_only=True):
     async with pool().acquire() as db:
@@ -129,7 +147,6 @@ async def apply_referral(referrer_user_id,referred_user_id):
 async def referral_count(user_id):
     async with pool().acquire() as db:return int(await db.fetchval("SELECT COUNT(*) FROM referrals WHERE referrer_user_id=$1",user_id))
 
-# Developer dashboard
 async def developer_users(limit=500):
     async with pool().acquire() as db:
         return await db.fetch("SELECT u.id,u.username,u.first_name,u.balance,u.wallet_address,COALESCE(r.cnt,0) referrals FROM users u LEFT JOIN (SELECT referrer_user_id,COUNT(*) cnt FROM referrals GROUP BY referrer_user_id) r ON r.referrer_user_id=u.id ORDER BY u.balance DESC,u.id LIMIT $1",limit)
