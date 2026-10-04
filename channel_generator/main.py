@@ -2,7 +2,6 @@ import asyncio
 import os
 import random
 import re
-from datetime import datetime, timezone
 
 import asyncpg
 from dotenv import load_dotenv
@@ -40,7 +39,6 @@ def make_username(title: str) -> str:
 
 
 async def ensure_tables(conn):
-    # This is deliberately additive: it does not replace the application's schema.
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS channel_generator_log (
             id BIGSERIAL PRIMARY KEY,
@@ -56,59 +54,80 @@ async def ensure_tables(conn):
 
 
 async def save_channel(conn, channel, username, invite_link, bot_added):
+    # Telegram channel IDs are integers in MTProto, while the ZIBSOL
+    # application stores chat_id as TEXT. Convert explicitly.
+    chat_id = str(channel.id)
+
     await conn.execute("""
         INSERT INTO channel_generator_log
             (channel_id, title, username, invite_link, reward_zibsol, bot_added)
         VALUES ($1, $2, $3, $4, 100, $5)
         ON CONFLICT (channel_id) DO UPDATE SET
+            title = EXCLUDED.title,
             username = EXCLUDED.username,
             invite_link = EXCLUDED.invite_link,
             bot_added = EXCLUDED.bot_added
     """, channel.id, channel.title, username, invite_link, bot_added)
 
-    # Try to insert into the application's channels table without assuming a
-    # particular schema. If it differs, the generated channel remains in the
-    # generator log and can be imported from there.
+    # The application schema is:
+    # channels(chat_id TEXT UNIQUE, title TEXT, reward BIGINT,
+    #          join_link TEXT NOT NULL, active BOOLEAN)
+    # Import only when a usable join URL exists.
+    if not invite_link:
+        print("  ! No usable join link; saved only in channel_generator_log.")
+        return
+
     try:
-        cols = await conn.fetch("""
-            SELECT column_name FROM information_schema.columns
-            WHERE table_name='channels' ORDER BY ordinal_position
-        """)
-        names = {r["column_name"] for r in cols}
-        if {"chat_id", "title", "reward"}.issubset(names):
-            fields = ["chat_id", "title", "reward"]
-            values = [channel.id, channel.title, 100]
-            if "username" in names:
-                fields.append("username"); values.append(username)
-            if "join_url" in names:
-                fields.append("join_url"); values.append(invite_link)
-            if "is_active" in names:
-                fields.append("is_active"); values.append(True)
-            placeholders = ",".join(f"${i}" for i in range(1, len(values)+1))
-            await conn.execute(
-                f"INSERT INTO channels ({','.join(fields)}) VALUES ({placeholders})",
-                *values
-            )
-            print("  -> added to application channels table")
+        await conn.execute("""
+            INSERT INTO channels (chat_id, title, reward, join_link, active)
+            VALUES ($1, $2, $3, $4, TRUE)
+            ON CONFLICT (chat_id) DO UPDATE SET
+                title = EXCLUDED.title,
+                reward = EXCLUDED.reward,
+                join_link = EXCLUDED.join_link,
+                active = TRUE
+        """, chat_id, channel.title, 100, invite_link)
+        print("  -> added to application channels table (100 ZIBSOL)")
     except Exception as exc:
         print(f"  ! Could not auto-import into channels table: {exc}")
         print("    Channel is still recorded in channel_generator_log.")
 
 
-async def add_bot(client, channel):
+async def add_bot_as_admin(client, channel):
+    """Promote the configured bot directly; do not use InviteToChannelRequest.
+
+    Telegram explicitly rejects inviting bots as ordinary channel members.
+    A user account that owns the channel can promote the bot with channels.editAdmin.
+    """
     if not BOT_USERNAME:
+        print("  ! BOT_USERNAME is empty; skipping bot admin setup.")
         return False
+
     try:
         bot = await client.get_input_entity(BOT_USERNAME)
-        await client(functions.channels.InviteToChannelRequest(
+
+        # Minimal useful channel-admin rights. The important part for ZIBSOL
+        # is that the bot is an administrator so Bot API getChatMember works.
+        rights = types.ChatAdminRights(
+            post_messages=True,
+            edit_messages=True,
+            delete_messages=True,
+            invite_users=True,
+        )
+
+        await client(functions.channels.EditAdminRequest(
             channel=channel,
-            users=[bot],
+            user_id=bot,
+            admin_rights=rights,
+            rank="ZIBSOL",
         ))
-        print(f"  -> invited @{BOT_USERNAME}")
+        print(f"  -> @{BOT_USERNAME} promoted to channel administrator")
         return True
+    except FloodWaitError:
+        raise
     except Exception as exc:
-        print(f"  ! Bot invite failed: {exc}")
-        print("    Add the bot as administrator manually if Telegram requires it.")
+        print(f"  ! Bot admin setup failed: {exc}")
+        print("    Add the ZIBSOL bot manually as a channel administrator if required.")
         return False
 
 
@@ -136,14 +155,12 @@ async def create_one(client, conn, index):
     except (UsernameOccupiedError, UsernameInvalidError) as exc:
         print(f"  ! Public username unavailable: {exc}")
         try:
-            invite = await client(functions.messages.ExportChatInviteRequest(
-                peer=channel
-            ))
+            invite = await client(functions.messages.ExportChatInviteRequest(peer=channel))
             invite_link = invite.link
         except Exception as exc2:
             print(f"  ! Could not create invite link: {exc2}")
 
-    bot_added = await add_bot(client, channel)
+    bot_added = await add_bot_as_admin(client, channel)
     await save_channel(conn, channel, actual_username, invite_link, bot_added)
     print(f"[{index}] {title} | id={channel.id} | @{actual_username or '-'}")
 
