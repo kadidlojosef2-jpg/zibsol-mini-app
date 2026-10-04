@@ -18,6 +18,10 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 COUNT = int(os.getenv("CHANNEL_COUNT", "10"))
 DELAY_MIN = int(os.getenv("DELAY_MIN", "20"))
 DELAY_MAX = int(os.getenv("DELAY_MAX", "45"))
+WELCOME_POST = os.getenv(
+    "WELCOME_POST_TEXT",
+    "🚀 Welcome!\n\nWelcome to our community! Stay tuned for the latest updates, news and useful content.\n\n👋 Thanks for joining!",
+).replace("\\n", "\n")
 
 WORDS_A = [
     "Nova", "Daily", "Urban", "Digital", "Future", "Market", "Crypto", "World",
@@ -54,8 +58,6 @@ async def ensure_tables(conn):
 
 
 async def save_channel(conn, channel, username, invite_link, bot_added):
-    # Telegram channel IDs are integers in MTProto, while the ZIBSOL
-    # application stores chat_id as TEXT. Convert explicitly.
     chat_id = str(channel.id)
 
     await conn.execute("""
@@ -69,10 +71,6 @@ async def save_channel(conn, channel, username, invite_link, bot_added):
             bot_added = EXCLUDED.bot_added
     """, channel.id, channel.title, username, invite_link, bot_added)
 
-    # The application schema is:
-    # channels(chat_id TEXT UNIQUE, title TEXT, reward BIGINT,
-    #          join_link TEXT NOT NULL, active BOOLEAN)
-    # Import only when a usable join URL exists.
     if not invite_link:
         print("  ! No usable join link; saved only in channel_generator_log.")
         return
@@ -94,20 +92,12 @@ async def save_channel(conn, channel, username, invite_link, bot_added):
 
 
 async def add_bot_as_admin(client, channel):
-    """Promote the configured bot directly; do not use InviteToChannelRequest.
-
-    Telegram explicitly rejects inviting bots as ordinary channel members.
-    A user account that owns the channel can promote the bot with channels.editAdmin.
-    """
     if not BOT_USERNAME:
         print("  ! BOT_USERNAME is empty; skipping bot admin setup.")
         return False
 
     try:
         bot = await client.get_input_entity(BOT_USERNAME)
-
-        # Minimal useful channel-admin rights. The important part for ZIBSOL
-        # is that the bot is an administrator so Bot API getChatMember works.
         rights = types.ChatAdminRights(
             post_messages=True,
             edit_messages=True,
@@ -129,6 +119,19 @@ async def add_bot_as_admin(client, channel):
         print(f"  ! Bot admin setup failed: {exc}")
         print("    Add the ZIBSOL bot manually as a channel administrator if required.")
         return False
+
+
+async def post_welcome(client, channel):
+    """Publish a simple welcome post from the channel owner account."""
+    try:
+        message = await client.send_message(channel, WELCOME_POST)
+        print("  -> welcome post published")
+        return message
+    except FloodWaitError:
+        raise
+    except Exception as exc:
+        print(f"  ! Welcome post failed: {exc}")
+        return None
 
 
 async def create_one(client, conn, index):
@@ -161,6 +164,7 @@ async def create_one(client, conn, index):
             print(f"  ! Could not create invite link: {exc2}")
 
     bot_added = await add_bot_as_admin(client, channel)
+    await post_welcome(client, channel)
     await save_channel(conn, channel, actual_username, invite_link, bot_added)
     print(f"[{index}] {title} | id={channel.id} | @{actual_username or '-'}")
 
@@ -169,6 +173,7 @@ async def main():
     print("ZIBSOL Channel Generator")
     print(f"Requested channels: {COUNT}")
     print("Names are random and do not contain 'ZIBSOL'.")
+    print("A welcome post will be published in every generated channel.")
     print("Press Ctrl+C to stop safely.\n")
 
     conn = await asyncpg.connect(DATABASE_URL)
