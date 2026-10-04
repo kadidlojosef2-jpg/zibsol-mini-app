@@ -119,7 +119,7 @@ async def complete_star_order(payload,telegram_user_id,charge_id):
             if order["status"]=="paid":return int(order["campaign_id"]) if order["campaign_id"] else None
             c=await db.fetchrow("INSERT INTO campaigns(user_id,target_members,price_zibsol,link,chat_id,status,payment_method,price_stars,stars_charge_id,reward_per_member) VALUES($1,$2,0,$3,$4,'pending','stars',$5,$6,$7) RETURNING id",order["user_id"],order["target_members"],order["link"],order["chat_id"],order["price_stars"],charge_id,PROMO_REWARD_PER_MEMBER); cid=int(c["id"]); await db.execute("UPDATE star_orders SET status='paid',campaign_id=$1,telegram_charge_id=$2,paid_at=NOW() WHERE id=$3",cid,charge_id,order["id"]); return cid
 async def list_campaigns_for_user(user_id):
-    async with pool().acquire() as db:return await db.fetch("SELECT id,target_members,completed_members,reward_per_member,link,chat_id,status,payment_method FROM campaigns WHERE status='pending' AND completed_members<target_members AND user_id<>$1 ORDER BY id DESC LIMIT 50",user_id)
+    async with pool().acquire() as db:return await db.fetch("SELECT id,target_members,completed_members,reward_per_member,link,chat_id,status,payment_method,user_id FROM campaigns WHERE status='pending' AND completed_members<target_members ORDER BY id DESC LIMIT 50")
 async def list_campaigns():
     async with pool().acquire() as db:return await db.fetch("SELECT id,user_id,target_members,completed_members,reward_per_member,link,chat_id,status,payment_method,created_at FROM campaigns ORDER BY id DESC LIMIT 100")
 async def claim_campaign(user_id,campaign_id):
@@ -143,6 +143,7 @@ async def apply_referral(referrer_user_id,referred_user_id):
         async with db.transaction():
             if not await db.fetchval("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1)",referrer_user_id):return False
             if await db.fetchval("SELECT EXISTS(SELECT 1 FROM referrals WHERE referred_user_id=$1)",referred_user_id):return False
+            await db.execute("INSERT INTO users(id) VALUES($1) ON CONFLICT(id) DO NOTHING",referred_user_id)
             await db.execute("INSERT INTO referrals(referred_user_id,referrer_user_id,reward) VALUES($1,$2,$3)",referred_user_id,referrer_user_id,REFERRAL_REWARD); await db.execute("UPDATE users SET balance=balance+$1 WHERE id=$2",REFERRAL_REWARD,referrer_user_id); await db.execute("INSERT INTO ledger(user_id,amount,reason,reference) VALUES($1,$2,$3,$4)",referrer_user_id,REFERRAL_REWARD,"referral",str(referred_user_id)); return True
 async def referral_count(user_id):
     async with pool().acquire() as db:return int(await db.fetchval("SELECT COUNT(*) FROM referrals WHERE referrer_user_id=$1",user_id))
