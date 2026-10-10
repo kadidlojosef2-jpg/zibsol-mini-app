@@ -34,6 +34,29 @@ async def shutdown():
 async def home(): return FileResponse(WEB/"index.html")
 @app.get("/tonconnect-manifest.json")
 async def tonconnect_manifest(): return {"url":os.getenv("APP_URL","https://zibsol-mini-app.onrender.com"),"name":"ZIBSOL","iconUrl":os.getenv("TON_ICON_URL","https://ton.org/download/ton_symbol.png")}
+@app.get("/solana")
+async def solana_token_page():
+ return FileResponse(BASE/"solana_site.html")
+
+@app.get("/api/solana/market")
+async def solana_market():
+ token=os.getenv("ZIBSOL_SOLANA_CA","4TQECKRv74c8ggXpyG1aBEvSe3JsrYoMMBAddXr7pump").strip()
+ if not token: raise HTTPException(503,"Solana token address is not configured")
+ try:
+  async with httpx.AsyncClient(timeout=12) as client:
+   response=await client.get(f"https://api.dexscreener.com/latest/dex/tokens/{token}")
+   response.raise_for_status()
+   payload=response.json()
+ except Exception as exc:
+  log.warning("Solana market data unavailable: %r",exc)
+  raise HTTPException(502,"Live market data is temporarily unavailable")
+ pairs=[p for p in (payload.get("pairs") or []) if p.get("chainId")=="solana" and (p.get("baseToken") or {}).get("address")==token]
+ pairs.sort(key=lambda p:float((p.get("liquidity") or {}).get("usd") or 0),reverse=True)
+ if not pairs:
+  return {"token_address":token,"available":False,"message":"No Solana market pair was returned by the data provider yet."}
+ p=pairs[0]
+ return {"token_address":token,"available":True,"pair_address":p.get("pairAddress"),"dex_id":p.get("dexId"),"url":p.get("url"),"price_usd":p.get("priceUsd"),"price_change_24h":(p.get("priceChange") or {}).get("h24"),"volume_24h":(p.get("volume") or {}).get("h24"),"liquidity_usd":(p.get("liquidity") or {}).get("usd"),"fdv":p.get("fdv"),"market_cap":p.get("marketCap"),"symbol":(p.get("baseToken") or {}).get("symbol","ZIBSOL")}
+
 @app.get("/health")
 async def health(): return {"ok":True,"database":"postgresql"}
 def get_telegram_user(authorization):
