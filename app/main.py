@@ -160,11 +160,8 @@ async def wallet(body:WalletBody,authorization:str|None=Header(default=None)):
 class WithdrawBody(BaseModel): wallet:str
 @app.post("/api/withdraw")
 async def withdraw(body:WithdrawBody,authorization:str|None=Header(default=None)):
- user=get_telegram_user(authorization); await db.upsert_user(user); wallet=body.wallet.strip() or await db.get_wallet(user["id"])
- if not wallet: raise HTTPException(400,"Connect or enter a TON/GRAM wallet first")
- wid,amount=await db.create_withdrawal(user["id"],wallet)
- if wid is None: raise HTTPException(400,f"Minimum withdrawal is {MIN_WITHDRAWAL:,} ZIBSOL")
- return {"withdrawal_id":wid,"amount_zibsol":amount,"gram":str(Decimal(amount)/ZIBSOL_PER_GRAM),"wallet":wallet}
+ get_telegram_user(authorization)
+ raise HTTPException(503,"Withdrawals are temporarily paused while the payout system is updated.")
 class AddChannelBody(BaseModel): chat_id:str; join_link:str; reward:int=Field(default=100,ge=1,le=1000000000); title:str|None=None
 @app.get("/api/admin/status")
 async def admin_status(authorization:str|None=Header(default=None)):
